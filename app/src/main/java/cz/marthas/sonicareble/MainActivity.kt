@@ -95,6 +95,11 @@ class MainActivity : AppCompatActivity() {
     private var gattConnectInProgress = false
     private var gattConnectionGeneration = 0
 
+    // One controlled retry for transient GATT_ERROR (257) during the
+    // early Condor handshake. Manual Connect resets this retry budget.
+    private var condorEarlyConnectRetryUsed = false
+    private val condorEarlyConnectRetryDelayMs = 1_500L
+
     private val handler = Handler(Looper.getMainLooper())
 
     private lateinit var logView: TextView
@@ -301,7 +306,7 @@ class MainActivity : AppCompatActivity() {
 
         requestBlePermissionsIfNeeded()
 
-        log("=== SONICARE BLE DIAGNOSTIC v0.1.14 ===")
+        log("=== SONICARE BLE DIAGNOSTIC v0.1.16 ===")
         log("Android SDK=${Build.VERSION.SDK_INT}")
         log("Device=${Build.MODEL}")
         log("Manufacturer=${Build.MANUFACTURER}")
@@ -562,7 +567,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectSelectedDevice() {
+    private fun connectSelectedDevice(autoRetry: Boolean = false) {
 
         val device = selectedDevice
 
@@ -580,6 +585,12 @@ class MainActivity : AppCompatActivity() {
         if (bluetoothGatt != null) {
             log("CONNECT: GATT already exists - ignoring second request")
             return
+        }
+
+        // A manual Connect starts a fresh retry budget.
+        // Automatic retry must keep the already-used budget.
+        if (!autoRetry) {
+            condorEarlyConnectRetryUsed = false
         }
 
         // Make sure BLE scanning is stopped before opening GATT.
@@ -754,6 +765,42 @@ class MainActivity : AppCompatActivity() {
                         gatt.close()
                     } catch (e: Exception) {
                         log("GATT close exception: ${e.message}")
+                    }
+
+                    // The first connection can occasionally die with GATT_ERROR
+                    // immediately after the early Condor CLIENT_CFG write.
+                    // Retry only once, and only while still in the early
+                    // handshake, so a real later disconnect is not hidden
+                    // behind an automatic reconnect loop.
+                    if (
+                        status == 257 &&
+                        condorStage <= 3 &&
+                        !condorEarlyConnectRetryUsed &&
+                        selectedDevice != null
+                    ) {
+                        condorEarlyConnectRetryUsed = true
+                        val retryDevice = selectedDevice
+
+                        log("")
+                        log("=== CONDOR EARLY GATT RETRY ===")
+                        log("Reason: GATT_ERROR 257 during early Condor handshake")
+                        log("Condor stage=$condorStage")
+                        log("Waiting ${condorEarlyConnectRetryDelayMs} ms before retry")
+
+                        handler.postDelayed({
+                            if (
+                                retryDevice != null &&
+                                bluetoothGatt == null &&
+                                !isGattConnected &&
+                                !gattConnectInProgress
+                            ) {
+                                selectedDevice = retryDevice
+                                log("CONDOR retry: starting second GATT connection")
+                                connectSelectedDevice(autoRetry = true)
+                            } else {
+                                log("CONDOR retry: skipped; GATT state changed")
+                            }
+                        }, condorEarlyConnectRetryDelayMs)
                     }
                 }
             }
