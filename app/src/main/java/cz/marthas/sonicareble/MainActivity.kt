@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanSettings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -29,6 +30,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
 
@@ -67,7 +70,13 @@ class MainActivity : AppCompatActivity() {
         // Condor framed protocol message types
         private const val CONDOR_MSG_INITIALIZE_REQ = 1
         private const val CONDOR_MSG_INITIALIZE_RESP = 2
+        private const val CONDOR_MSG_PUT_PROPS = 3
+        private const val CONDOR_MSG_GET_PROPS = 4
+        private const val CONDOR_MSG_SUBSCRIBE = 5
+        private const val CONDOR_MSG_UNSUBSCRIBE = 6
         private const val CONDOR_MSG_GENERIC_RESP = 7
+        private const val CONDOR_MSG_GET_PRODUCTS = 10
+        private const val CONDOR_MSG_GET_PORTS = 11
 
         // 1-byte transport header: low 6 bits are sequence number.
         private const val CONDOR_SEQ_MASK = 0x3F
@@ -79,6 +88,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private var bleScanner: BluetoothLeScanner? = null
     private var bluetoothGatt: BluetoothGatt? = null
+    private var isGattConnected = false
+
+    // Connection guard: prevents a second connectGatt() while the first
+    // connection is still being established.
+    private var gattConnectInProgress = false
+    private var gattConnectionGeneration = 0
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -117,7 +132,59 @@ class MainActivity : AppCompatActivity() {
     private var condorNextTxSeq = 1
     private var condorRxFrameBuffer = ByteArray(0)
 
-    private val scanDurationMs = 10_000L
+    // Android GATT writes must be paced one operation at a time. The original
+    // implementation sent all Condor fragments back-to-back, which can make
+    // Android reject the second WRITE_NO_RESPONSE with GATT error 201.
+    //
+    // We intentionally do NOT wait for the Condor RX_ACK between fragments.
+    // The upstream implementation serializes BLE writes by awaiting the
+    // completion of each write operation; the next fragment is therefore
+    // started from onCharacteristicWrite().
+    private val condorTxFrameQueue = java.util.ArrayDeque<ByteArray>()
+    private var condorTxActiveFrame: ByteArray? = null
+    private var condorTxActiveOffset = 0
+    private var condorTxWriteInFlight = false
+    private val condorTxWriteTimeoutMs = 5_000L
+    private val condorTxWriteTimeoutRunnable = Runnable {
+        val gatt = bluetoothGatt
+        if (condorTxWriteInFlight && gatt != null) {
+            log(
+                "CONDOR TX WRITE TIMEOUT after ${condorTxWriteTimeoutMs} ms; " +
+                    "BLE write callback did not arrive"
+            )
+            log(
+                "CONDOR TX: aborting current frame to avoid sending " +
+                    "fragments out of order"
+            )
+            condorTxWriteInFlight = false
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            condorTxFrameQueue.clear()
+        }
+    }
+
+    // Protocol discovery state. The actual HX741X product/port names are
+    // discovered from the toothbrush instead of being hard-coded.
+    private enum class CondorPendingRequest {
+        NONE,
+        GET_PRODUCTS,
+        GET_PORTS,
+        GET_PROPS
+    }
+
+    private var condorPendingRequest = CondorPendingRequest.NONE
+    private val condorProductIds = mutableListOf<String>()
+    private val condorPorts = mutableListOf<String>()
+    private var condorProductIndex = 0
+    private var condorPortIndex = 0
+    private var condorCurrentProductId: String? = null
+    private var condorCurrentPort: String? = null
+    private var condorDiscoveryActive = false
+
+    // Human-readable record of every successful GetProps response.
+    private val condorDiscoveredProps = mutableListOf<String>()
+
+    private val scanDurationMs = 30_000L
 
     private val timeFormat =
         SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
@@ -142,10 +209,23 @@ class MainActivity : AppCompatActivity() {
 
             val rawAdvertisement = result.scanRecord?.bytes
 
-            val containsCondor =
+            val advertisedServiceUuids =
+                result.scanRecord?.serviceUuids
+                    ?.map { it.uuid }
+                    ?: emptyList()
+
+            val containsCondorName =
                 rawAdvertisement?.let {
                     bytesToAscii(it).contains("Condor", ignoreCase = true)
                 } == true
+
+            val containsCondorService =
+                advertisedServiceUuids.any {
+                    it == CONDOR_SERVICE_UUID
+                }
+
+            val containsCondor =
+                containsCondorName || containsCondorService
 
             log(
                 "SCAN: ${device.address} " +
@@ -153,6 +233,13 @@ class MainActivity : AppCompatActivity() {
                     "name=${name ?: "<null>"}" +
                     if (containsCondor) " [CONDOR]" else ""
             )
+
+            if (containsCondorService) {
+                log(
+                    "SCAN SERVICE UUID: " +
+                        advertisedServiceUuids.joinToString(", ")
+                )
+            }
 
             if (containsCondor ||
                 name?.contains("Sonicare", ignoreCase = true) == true
@@ -164,6 +251,9 @@ class MainActivity : AppCompatActivity() {
                         "SCAN: selected ${device.address} " +
                             "name=${name ?: "<null>"}"
                     )
+
+                    log("SCAN: Sonicare selected -> stopping scan before GATT connect")
+                    stopScan()
 
                     updateStatus(
                         "Nalezeno: ${name ?: "Philips Sonicare"} " +
@@ -211,7 +301,7 @@ class MainActivity : AppCompatActivity() {
 
         requestBlePermissionsIfNeeded()
 
-        log("=== SONICARE BLE DIAGNOSTIC v0.1.6 ===")
+        log("=== SONICARE BLE DIAGNOSTIC v0.1.14 ===")
         log("Android SDK=${Build.VERSION.SDK_INT}")
         log("Device=${Build.MODEL}")
         log("Manufacturer=${Build.MANUFACTURER}")
@@ -354,10 +444,33 @@ class MainActivity : AppCompatActivity() {
 
         isScanning = true
 
-        bleScanner?.startScan(scanCallback)
+        val scanSettings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setReportDelay(0L)
+            .build()
+
+        log("SCAN settings: LOW_LATENCY, reportDelay=0ms, duration=${scanDurationMs}ms")
+
+        bleScanner?.startScan(
+            null,
+            scanSettings,
+            scanCallback
+        )
 
         handler.postDelayed({
+            if (!isScanning) {
+                return@postDelayed
+            }
+
             stopScan()
+
+            // A bonded Sonicare may currently be connected by another Philips
+            // app/service and therefore may not be advertising at all. In that
+            // case the normal BLE scanner cannot report it. Use the bonded LE
+            // device list only as a fallback when the scan found nothing.
+            if (selectedDevice == null) {
+                selectBondedSonicareFallback()
+            }
 
             if (selectedDevice != null) {
                 updateStatus(
@@ -367,6 +480,67 @@ class MainActivity : AppCompatActivity() {
                 updateStatus("Sonicare nenalezena")
             }
         }, scanDurationMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun selectBondedSonicareFallback() {
+        if (selectedDevice != null) {
+            return
+        }
+
+        val bondedDevices = try {
+            bluetoothAdapter.bondedDevices
+        } catch (e: SecurityException) {
+            log("SCAN fallback: BLUETOOTH_CONNECT permission denied")
+            return
+        } catch (e: Exception) {
+            log("SCAN fallback: cannot read bonded devices: ${e.message}")
+            return
+        }
+
+        if (bondedDevices.isEmpty()) {
+            log("SCAN fallback: no bonded Bluetooth devices")
+            return
+        }
+
+        log("SCAN fallback: checking ${bondedDevices.size} bonded device(s)")
+
+        val candidate = bondedDevices.firstOrNull { device ->
+            val name = try {
+                device.name
+            } catch (_: SecurityException) {
+                null
+            }
+
+            name?.contains("Sonicare", ignoreCase = true) == true ||
+                name?.contains("Philips", ignoreCase = true) == true
+        }
+
+        if (candidate != null) {
+            selectedDevice = candidate
+
+            val name = try {
+                candidate.name
+            } catch (_: SecurityException) {
+                null
+            }
+
+            log(
+                "SCAN fallback: bonded Sonicare selected -> " +
+                    "${candidate.address} name=${name ?: "<null>"}"
+            )
+            log(
+                "SCAN fallback: device may currently be connected by " +
+                    "another Philips service and therefore not advertising"
+            )
+
+            updateStatus(
+                "Nalezena spárovaná Sonicare: " +
+                    "${name ?: "Philips Sonicare"} (${candidate.address})"
+            )
+        } else {
+            log("SCAN fallback: no bonded Sonicare/Philips device found")
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -398,17 +572,30 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        if (bluetoothGatt != null) {
-            log("CONNECT: GATT already exists")
+        if (gattConnectInProgress) {
+            log("CONNECT: connection already in progress - ignoring second request")
             return
         }
+
+        if (bluetoothGatt != null) {
+            log("CONNECT: GATT already exists - ignoring second request")
+            return
+        }
+
+        // Make sure BLE scanning is stopped before opening GATT.
+        stopScan()
+
+        gattConnectInProgress = true
+        gattConnectionGeneration++
+        val generation = gattConnectionGeneration
 
         log("")
         log("=== GATT CONNECT ===")
         log("Address: ${device.address}")
+        log("Connection generation=$generation")
 
         try {
-            bluetoothGatt =
+            val newGatt =
                 device.connectGatt(
                     this,
                     false,
@@ -416,9 +603,15 @@ class MainActivity : AppCompatActivity() {
                     BluetoothDevice.TRANSPORT_LE
                 )
 
+            bluetoothGatt = newGatt
+
+            log(
+                "GATT object created: id=${System.identityHashCode(newGatt)}"
+            )
             updateStatus("Připojuji...")
         } catch (e: Exception) {
-            log("CONNECT EXCEPTION: ${e.message}")
+            log("CONNECT EXCEPTION: ${e.javaClass.simpleName}: ${e.message}")
+            gattConnectInProgress = false
             bluetoothGatt = null
         }
     }
@@ -427,6 +620,8 @@ class MainActivity : AppCompatActivity() {
     private fun disconnectGatt() {
 
         log("GATT: disconnect requested")
+
+        gattConnectInProgress = false
 
         try {
             bluetoothGatt?.disconnect()
@@ -450,20 +645,71 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 log(
-                    "GATT state=$newState status=$status " +
+                    "GATT callback id=${System.identityHashCode(gatt)} " +
+                        "state=$newState status=$status " +
                         "(${gattStatusName(status)})"
                 )
+
+                // Ignore callbacks from an old GATT object after a newer
+                // connection has already replaced it.
+                if (
+                    bluetoothGatt != null &&
+                    bluetoothGatt !== gatt
+                ) {
+                    log(
+                        "GATT: stale callback from old connection object " +
+                            "id=${System.identityHashCode(gatt)}"
+                    )
+
+                    if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                        try {
+                            gatt.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    return
+                }
 
                 if (
                     newState ==
                     BluetoothGatt.STATE_CONNECTED
                 ) {
 
-                    log("GATT CONNECTED")
+                    gattConnectInProgress = false
+                    isGattConnected = true
+                    log(
+                        "GATT CONNECTED id=${System.identityHashCode(gatt)}"
+                    )
+
+                    // Start every GATT session with clean Condor state.
+                    condorStage = 0
+                    condorPendingRequest = CondorPendingRequest.NONE
+                    condorDiscoveryActive = false
+                    condorRxFrameBuffer = ByteArray(0)
+                    condorNextTxSeq = 1
+                    resetCondorTxWriteQueue()
+                    condorProductIds.clear()
+                    condorPorts.clear()
+                    condorProductIndex = 0
+                    condorPortIndex = 0
+                    condorCurrentProductId = null
+                    condorCurrentPort = null
+                    condorDiscoveredProps.clear()
 
                     updateStatus("Připojeno")
 
                     handler.postDelayed({
+
+                        if (
+                            bluetoothGatt != gatt ||
+                            !isGattConnected
+                        ) {
+                            log(
+                                "GATT: service discovery skipped; connection is gone"
+                            )
+                            return@postDelayed
+                        }
 
                         log(
                             "GATT: starting service discovery"
@@ -490,10 +736,25 @@ class MainActivity : AppCompatActivity() {
                         "GATT disconnect status=$status " +
                             "(${gattStatusName(status)})"
                     )
+                    log(
+                        "CONDOR stage at disconnect=$condorStage"
+                    )
 
+                    isGattConnected = false
+                    gattConnectInProgress = false
+                    condorDiscoveryActive = false
+                    resetCondorTxWriteQueue()
                     updateStatus("Odpojeno")
 
-                    bluetoothGatt = null
+                    if (bluetoothGatt == gatt) {
+                        bluetoothGatt = null
+                    }
+
+                    try {
+                        gatt.close()
+                    } catch (e: Exception) {
+                        log("GATT close exception: ${e.message}")
+                    }
                 }
             }
 
@@ -527,16 +788,27 @@ class MainActivity : AppCompatActivity() {
 
                 log("")
                 log(
-                    "=== STANDARD GATT READS ==="
+                    "=== STANDARD GATT READS SKIPPED ==="
                 )
-
-                readStandardCharacteristics(gatt)
+                log(
+                    "Skipping ordinary GATT reads during Condor handshake " +
+                        "to avoid competing asynchronous ATT operations."
+                )
 
                 handler.postDelayed({
 
-                    enableServerCfgNotify(gatt)
+                    if (
+                        bluetoothGatt == gatt &&
+                        isGattConnected
+                    ) {
+                        enableServerCfgNotify(gatt)
+                    } else {
+                        log(
+                            "SERVER_CFG setup skipped: GATT is no longer connected"
+                        )
+                    }
 
-                }, 1000)
+                }, 500)
             }
 
             override fun onCharacteristicRead(
@@ -609,8 +881,13 @@ class MainActivity : AppCompatActivity() {
                         condorStage = 1
 
                         handler.postDelayed({
-                            attemptCondorVersionWrite(gatt)
-                        }, 500)
+                            if (
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                attemptCondorVersionWrite(gatt)
+                            }
+                        }, 100)
                     }
 
                     CHAR_NOTIFY_TX_UUID -> {
@@ -618,12 +895,17 @@ class MainActivity : AppCompatActivity() {
                         condorStage = 2
 
                         handler.postDelayed({
-                            enableCondorNotify(
-                                gatt,
-                                CHAR_NOTIFY_RX_UUID,
-                                "RX_ACK"
-                            )
-                        }, 250)
+                            if (
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                enableCondorNotify(
+                                    gatt,
+                                    CHAR_NOTIFY_RX_UUID,
+                                    "RX_ACK"
+                                )
+                            }
+                        }, 100)
                     }
 
                     CHAR_NOTIFY_RX_UUID -> {
@@ -631,17 +913,22 @@ class MainActivity : AppCompatActivity() {
                         condorStage = 3
 
                         handler.postDelayed({
-                            attemptCondorClientCfgWrite(
-                                gatt,
-                                byteArrayOf(
-                                    0xFF.toByte(),
-                                    0xFF.toByte(),
-                                    0xFF.toByte(),
-                                    0xFF.toByte()
-                                ),
-                                "FF FF FF FF"
-                            )
-                        }, 250)
+                            if (
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                attemptCondorClientCfgWrite(
+                                    gatt,
+                                    byteArrayOf(
+                                        0xFF.toByte(),
+                                        0xFF.toByte(),
+                                        0xFF.toByte(),
+                                        0xFF.toByte()
+                                    ),
+                                    "FF FF FF FF"
+                                )
+                            }
+                        }, 100)
                     }
                 }
             }
@@ -701,6 +988,17 @@ class MainActivity : AppCompatActivity() {
                             "VALUE ASCII: $ascii"
                         )
                     }
+                }
+
+                if (
+                    characteristic.uuid ==
+                    CHAR_WRITE_NR_UUID &&
+                    condorTxWriteInFlight
+                ) {
+                    handleCondorFrameWriteCallback(
+                        gatt,
+                        status
+                    )
                 }
 
                 if (
@@ -781,16 +1079,42 @@ class MainActivity : AppCompatActivity() {
                         condorStage == 1
                     ) {
                         log(
-                            "CONDOR V4 confirmed -> enabling TX notify"
+                            "CONDOR V4 confirmed -> TX notify scheduled after 500 ms"
+                        )
+
+                        log(
+                            "TX notify timing: waiting 500 ms after SERVER_CFG=04"
                         )
 
                         handler.postDelayed({
-                            enableCondorNotify(
-                                gatt,
-                                CHAR_NOTIFY_TX_UUID,
-                                "TX"
+                            log(
+                                "TX notify delay elapsed; checking GATT before enable"
                             )
-                        }, 250)
+
+                            log(
+                                "TX notify GATT check: same=${bluetoothGatt === gatt}, " +
+                                    "connected=$isGattConnected, gattId=${System.identityHashCode(gatt)}"
+                            )
+
+                            if (
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                log(
+                                    "TX notify: calling enableCondorNotify()"
+                                )
+
+                                enableCondorNotify(
+                                    gatt,
+                                    CHAR_NOTIFY_TX_UUID,
+                                    "TX"
+                                )
+                            } else {
+                                log(
+                                    "TX notify ABORTED: GATT changed or disconnected"
+                                )
+                            }
+                        }, 500)
                     }
 
                     if (
@@ -808,8 +1132,13 @@ class MainActivity : AppCompatActivity() {
                         condorStage = 5
 
                         handler.postDelayed({
-                            attemptCondorOpenRx(gatt)
-                        }, 250)
+                            if (
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                attemptCondorOpenRx(gatt)
+                            }
+                        }, 100)
                     }
                 }
 
@@ -837,8 +1166,13 @@ class MainActivity : AppCompatActivity() {
                     updateStatus("Condor V4 handshake OK")
 
                     handler.postDelayed({
-                        attemptCondorInitializeReq(gatt)
-                    }, 250)
+                        if (
+                            bluetoothGatt == gatt &&
+                            isGattConnected
+                        ) {
+                            attemptCondorInitializeReq(gatt)
+                        }
+                    }, 100)
                 }
             }
         }
@@ -1030,8 +1364,17 @@ class MainActivity : AppCompatActivity() {
                     )
 
                 log(
-                    "writeDescriptor API33+ result=$result"
+                    "writeDescriptor API33+ immediateResult=$result"
                 )
+
+                if (
+                    result != BluetoothGatt.GATT_SUCCESS
+                ) {
+                    log(
+                        "ERROR: CCCD write was not accepted by Android " +
+                            "(immediate status=$result)"
+                    )
+                }
 
             } else {
 
@@ -1097,7 +1440,13 @@ class MainActivity : AppCompatActivity() {
 
             log(
                 "setCharacteristicNotification($label)=" +
-                    localResult
+                    localResult +
+                    " gattId=${System.identityHashCode(gatt)}"
+            )
+
+            log(
+                "CCCD $label: uuid=${cccd.uuid}, currentValue=" +
+                    try { bytesToHex(cccd.value ?: ByteArray(0)) } catch (_: Exception) { "<unavailable>" }
             )
 
             val value =
@@ -1111,8 +1460,8 @@ class MainActivity : AppCompatActivity() {
                     )
 
                 log(
-                    "writeDescriptor API33+ " +
-                        "$label result=$result"
+                    "writeDescriptor API33+ $label: result=$result, " +
+                        "value=${bytesToHex(value)}, gattId=${System.identityHashCode(gatt)}"
                 )
             } else {
                 @Suppress("DEPRECATION")
@@ -1141,6 +1490,13 @@ class MainActivity : AppCompatActivity() {
         value: ByteArray,
         description: String
     ) {
+        if (
+            bluetoothGatt != gatt ||
+            !isGattConnected
+        ) {
+            log("CLIENT_CFG write skipped: GATT is no longer connected")
+            return
+        }
         log("")
         log("=== CONDOR CLIENT_CFG WRITE ===")
         log("Target: $CHAR_CLIENT_CFG_UUID")
@@ -1208,6 +1564,13 @@ class MainActivity : AppCompatActivity() {
     private fun attemptCondorOpenRx(
         gatt: BluetoothGatt
     ) {
+        if (
+            bluetoothGatt != gatt ||
+            !isGattConnected
+        ) {
+            log("RX open skipped: GATT is no longer connected")
+            return
+        }
         log("")
         log("=== CONDOR OPEN RX CHANNEL ===")
         log("Target: $CHAR_WRITE_NR_UUID")
@@ -1284,6 +1647,14 @@ class MainActivity : AppCompatActivity() {
     private fun attemptCondorInitializeReq(
         gatt: BluetoothGatt
     ) {
+        if (
+            bluetoothGatt != gatt ||
+            !isGattConnected
+        ) {
+            log("InitializeReq skipped: GATT is no longer connected")
+            return
+        }
+
         if (condorStage < 7) {
             log("CONDOR: InitializeReq skipped, handshake not complete")
             return
@@ -1316,10 +1687,126 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("MissingPermission")
+    private fun attemptCondorGetProducts(
+        gatt: BluetoothGatt
+    ) {
+        if (condorStage < 8) {
+            log("CONDOR: GetProducts skipped, InitializeReq sequence not complete")
+            return
+        }
+
+        condorPendingRequest = CondorPendingRequest.GET_PRODUCTS
+        condorDiscoveryActive = true
+        condorProductIds.clear()
+        condorPorts.clear()
+        condorProductIndex = 0
+        condorPortIndex = 0
+        condorCurrentProductId = null
+        condorCurrentPort = null
+        condorDiscoveredProps.clear()
+
+        log("")
+        log("=== CONDOR GET PRODUCTS REQUEST ===")
+        log("Starting automatic product -> port -> props discovery")
+        log("Message type: 10 (GetProducts)")
+        log("Body length: 0")
+
+        val frame =
+            byteArrayOf(
+                0xFE.toByte(),
+                0xFF.toByte(),
+                CONDOR_MSG_GET_PRODUCTS.toByte(),
+                0x00,
+                0x00
+            )
+
+        log("Frame HEX: ${bytesToHex(frame)}")
+        log("Transport sequence start: $condorNextTxSeq")
+
+        sendCondorFrame(gatt, frame)
+        updateStatus("Condor GetProducts odeslán")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun attemptCondorGetPorts(
+        gatt: BluetoothGatt,
+        productId: String
+    ) {
+        condorPendingRequest = CondorPendingRequest.GET_PORTS
+        condorCurrentProductId = productId
+
+        val body = productId.toByteArray(Charsets.US_ASCII) + byteArrayOf(0x00)
+        val frame = buildCondorFrame(CONDOR_MSG_GET_PORTS, body)
+
+        log("")
+        log("=== CONDOR GET PORTS REQUEST ===")
+        log("Message type: 11 (GetPorts)")
+        log("Product ID: $productId")
+        log("Body length: ${body.size}")
+        log("Body HEX: ${bytesToHex(body)}")
+        log("Frame HEX: ${bytesToHex(frame)}")
+        log("Transport sequence start: $condorNextTxSeq")
+
+        sendCondorFrame(gatt, frame)
+        updateStatus("Condor GetPorts: $productId")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun attemptCondorGetProps(
+        gatt: BluetoothGatt,
+        productId: String,
+        port: String
+    ) {
+        condorPendingRequest = CondorPendingRequest.GET_PROPS
+        condorCurrentProductId = productId
+        condorCurrentPort = port
+
+        val body =
+            productId.toByteArray(Charsets.US_ASCII) +
+                byteArrayOf(0x00) +
+                port.toByteArray(Charsets.US_ASCII) +
+                byteArrayOf(0x00)
+
+        val frame = buildCondorFrame(CONDOR_MSG_GET_PROPS, body)
+
+        log("")
+        log("=== CONDOR GET PROPS REQUEST ===")
+        log("Message type: 4 (GetProps)")
+        log("Product ID: $productId")
+        log("Port: $port")
+        log("Body length: ${body.size}")
+        log("Body HEX: ${bytesToHex(body)}")
+        log("Frame HEX: ${bytesToHex(frame)}")
+        log("Transport sequence start: $condorNextTxSeq")
+
+        sendCondorFrame(gatt, frame)
+        updateStatus("Condor GetProps: $productId / $port")
+    }
+
+    private fun buildCondorFrame(
+        messageType: Int,
+        body: ByteArray
+    ): ByteArray {
+        val frame = ByteArray(5 + body.size)
+        frame[0] = 0xFE.toByte()
+        frame[1] = 0xFF.toByte()
+        frame[2] = messageType.toByte()
+        frame[3] = ((body.size shr 8) and 0xFF).toByte()
+        frame[4] = (body.size and 0xFF).toByte()
+        body.copyInto(frame, 5)
+        return frame
+    }
+
+    @SuppressLint("MissingPermission")
     private fun sendCondorFrame(
         gatt: BluetoothGatt,
         frame: ByteArray
     ) {
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR FRAME WRITE skipped: GATT is no longer connected")
+            return
+        }
+
         val service = gatt.getService(CONDOR_SERVICE_UUID)
 
         if (service == null) {
@@ -1335,84 +1822,264 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Channel config reported 244 bytes, but without an explicit ATT
-        // MTU exchange Android normally gives us a 20-byte BLE payload.
-        val maxBleWrite = 20
-        val chunkPayloadSize = maxBleWrite - 1
+        log(
+            "CONDOR TX frame queued: ${frame.size} bytes; " +
+                "BLE fragments=${((frame.size + 18) / 19)}; " +
+                "writeInFlight=$condorTxWriteInFlight"
+        )
 
-        var offset = 0
+        // Copy the frame so callers can safely reuse their temporary ByteArray.
+        condorTxFrameQueue.add(frame.copyOf())
 
-        while (offset < frame.size) {
-            val end =
-                minOf(
-                    offset + chunkPayloadSize,
-                    frame.size
-                )
+        if (!condorTxWriteInFlight && condorTxActiveFrame == null) {
+            startNextCondorTxFrame(gatt)
+        }
+    }
 
-            val chunk =
-                frame.copyOfRange(
-                    offset,
-                    end
-                )
+    @SuppressLint("MissingPermission")
+    private fun startNextCondorTxFrame(
+        gatt: BluetoothGatt
+    ) {
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR TX: cannot start frame, GATT is disconnected")
+            return
+        }
 
-            val seq =
-                condorNextTxSeq and CONDOR_SEQ_MASK
+        if (condorTxWriteInFlight) {
+            return
+        }
 
-            condorNextTxSeq =
-                (condorNextTxSeq + 1) and CONDOR_SEQ_MASK
-
-            val packet =
-                byteArrayOf(seq.toByte()) + chunk
-
-            log(
-                "CONDOR RX TX packet: " +
-                    "seq=$seq " +
-                    "HEX=${bytesToHex(packet)}"
-            )
-
-            try {
-                if (Build.VERSION.SDK_INT >= 33) {
-                    val result =
-                        gatt.writeCharacteristic(
-                            characteristic,
-                            packet,
-                            BluetoothGattCharacteristic
-                                .WRITE_TYPE_NO_RESPONSE
-                        )
-
-                    log(
-                        "writeCharacteristic API33+ " +
-                            "returned=$result"
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    characteristic.value = packet
-
-                    characteristic.writeType =
-                        BluetoothGattCharacteristic
-                            .WRITE_TYPE_NO_RESPONSE
-
-                    @Suppress("DEPRECATION")
-                    val result =
-                        gatt.writeCharacteristic(
-                            characteristic
-                        )
-
-                    log(
-                        "writeCharacteristic returned=$result"
-                    )
-                }
-            } catch (e: Exception) {
-                log(
-                    "CONDOR FRAME WRITE EXCEPTION: " +
-                        "${e.javaClass.simpleName}: " +
-                        "${e.message}"
-                )
+        if (condorTxActiveFrame == null) {
+            if (condorTxFrameQueue.isEmpty()) {
                 return
             }
 
-            offset = end
+            condorTxActiveFrame = condorTxFrameQueue.removeFirst()
+            condorTxActiveOffset = 0
+
+            log(
+                "CONDOR TX: starting queued frame " +
+                    "(${condorTxActiveFrame!!.size} bytes)"
+            )
         }
+
+        sendNextCondorTxFragment(gatt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendNextCondorTxFragment(
+        gatt: BluetoothGatt
+    ) {
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR TX: fragment send aborted, GATT is disconnected")
+            return
+        }
+
+        if (condorTxWriteInFlight) {
+            log("CONDOR TX: fragment send skipped, another write is in flight")
+            return
+        }
+
+        val frame = condorTxActiveFrame
+
+        if (frame == null) {
+            startNextCondorTxFrame(gatt)
+            return
+        }
+
+        if (condorTxActiveOffset >= frame.size) {
+            log("CONDOR TX: frame completely sent")
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            startNextCondorTxFrame(gatt)
+            return
+        }
+
+        val service = gatt.getService(CONDOR_SERVICE_UUID)
+        val characteristic =
+            service?.getCharacteristic(CHAR_WRITE_NR_UUID)
+
+        if (characteristic == null) {
+            log("CONDOR RX WRITE characteristic NOT FOUND")
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            condorTxFrameQueue.clear()
+            return
+        }
+
+        // Channel config reported 244 bytes, but without an explicit ATT
+        // MTU exchange Android normally gives us a 20-byte BLE payload.
+        // One byte is reserved for the Condor transport sequence header.
+        val maxBleWrite = 20
+        val chunkPayloadSize = maxBleWrite - 1
+        val end = minOf(
+            condorTxActiveOffset + chunkPayloadSize,
+            frame.size
+        )
+
+        val chunk =
+            frame.copyOfRange(
+                condorTxActiveOffset,
+                end
+            )
+
+        val seq =
+            condorNextTxSeq and CONDOR_SEQ_MASK
+
+        val packet =
+            byteArrayOf(seq.toByte()) + chunk
+
+        log(
+            "CONDOR RX TX packet: " +
+                "seq=$seq " +
+                "offset=$condorTxActiveOffset..${end - 1} " +
+                "${end}/${frame.size} bytes " +
+                "HEX=${bytesToHex(packet)}"
+        )
+
+        try {
+            val accepted: Boolean
+
+            if (Build.VERSION.SDK_INT >= 33) {
+                val result =
+                    gatt.writeCharacteristic(
+                        characteristic,
+                        packet,
+                        BluetoothGattCharacteristic
+                            .WRITE_TYPE_NO_RESPONSE
+                    )
+
+                log(
+                    "writeCharacteristic API33+ returned=$result"
+                )
+
+                accepted =
+                    result == BluetoothGatt.GATT_SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = packet
+
+                characteristic.writeType =
+                    BluetoothGattCharacteristic
+                        .WRITE_TYPE_NO_RESPONSE
+
+                @Suppress("DEPRECATION")
+                accepted =
+                    gatt.writeCharacteristic(characteristic)
+
+                log(
+                    "writeCharacteristic returned=$accepted"
+                )
+            }
+
+            if (!accepted) {
+                log(
+                    "CONDOR TX fragment rejected immediately"
+                )
+                log(
+                    "CONDOR TX: aborting current frame; " +
+                        "no subsequent fragment will be sent"
+                )
+                condorTxWriteInFlight = false
+                condorTxActiveFrame = null
+                condorTxActiveOffset = 0
+                condorTxFrameQueue.clear()
+                return
+            }
+
+            // Only now, after Android accepted the write operation, advance
+            // the Condor sequence and remember that this exact fragment is
+            // waiting for onCharacteristicWrite().
+            condorNextTxSeq =
+                (condorNextTxSeq + 1) and CONDOR_SEQ_MASK
+
+            condorTxActiveOffset = end
+            condorTxWriteInFlight = true
+
+            handler.removeCallbacks(condorTxWriteTimeoutRunnable)
+            handler.postDelayed(
+                condorTxWriteTimeoutRunnable,
+                condorTxWriteTimeoutMs
+            )
+
+            log(
+                "CONDOR TX: fragment accepted; waiting for " +
+                    "onCharacteristicWrite() before sending next fragment"
+            )
+        } catch (e: Exception) {
+            log(
+                "CONDOR FRAME WRITE EXCEPTION: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+            condorTxWriteInFlight = false
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            condorTxFrameQueue.clear()
+        }
+    }
+
+    private fun handleCondorFrameWriteCallback(
+        gatt: BluetoothGatt,
+        status: Int
+    ) {
+        handler.removeCallbacks(condorTxWriteTimeoutRunnable)
+
+        if (!condorTxWriteInFlight) {
+            log("CONDOR TX: unexpected RX WRITE callback")
+            return
+        }
+
+        condorTxWriteInFlight = false
+
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            log(
+                "CONDOR TX: BLE write callback FAILED: " +
+                    "status=$status (${gattStatusName(status)})"
+            )
+            log(
+                "CONDOR TX: aborting current frame; " +
+                    "queued frames=${condorTxFrameQueue.size}"
+            )
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            condorTxFrameQueue.clear()
+            return
+        }
+
+        log(
+            "CONDOR TX: BLE write callback OK; " +
+                "fragment complete at offset=$condorTxActiveOffset"
+        )
+
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR TX: callback received after GATT disconnect")
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            condorTxFrameQueue.clear()
+            return
+        }
+
+        val frame = condorTxActiveFrame
+
+        if (frame != null && condorTxActiveOffset < frame.size) {
+            // IMPORTANT: do not wait for Condor RX_ACK here. The upstream
+            // implementation serializes the BLE write operation itself, then
+            // immediately sends the next fragment.
+            sendNextCondorTxFragment(gatt)
+        } else {
+            log("CONDOR TX: complete frame sent successfully")
+            condorTxActiveFrame = null
+            condorTxActiveOffset = 0
+            startNextCondorTxFrame(gatt)
+        }
+    }
+
+    private fun resetCondorTxWriteQueue() {
+        handler.removeCallbacks(condorTxWriteTimeoutRunnable)
+        condorTxWriteInFlight = false
+        condorTxActiveFrame = null
+        condorTxActiveOffset = 0
+        condorTxFrameQueue.clear()
     }
 
     @SuppressLint("MissingPermission")
@@ -1487,9 +2154,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val ackByte: Byte =
+            (seq.toInt() and CONDOR_SEQ_MASK).toByte()
+
         val ack =
             byteArrayOf(
-                (seq and CONDOR_SEQ_MASK).toByte()
+                ackByte
             )
 
         log(
@@ -1624,8 +2294,290 @@ class MainActivity : AppCompatActivity() {
                 updateStatus(
                     "Condor InitializeResp přijata"
                 )
+
+                handler.postDelayed({
+                    if (bluetoothGatt != null) {
+                        attemptCondorGetProducts(bluetoothGatt!!)
+                    }
+                }, 250)
+            } else if (
+                msgType == CONDOR_MSG_GENERIC_RESP
+            ) {
+                handleCondorGenericResponse(body)
             }
         }
+    }
+
+    private fun handleCondorGenericResponse(body: ByteArray) {
+        if (body.isEmpty()) {
+            log("CONDOR GenericResp body is empty")
+            return
+        }
+
+        val status = body[0].toInt() and 0xFF
+        val jsonText =
+            if (body.size > 1) {
+                String(body.copyOfRange(1, body.size), Charsets.UTF_8)
+                    .trimEnd('\u0000')
+                    .trim()
+            } else {
+                ""
+            }
+
+        log("CONDOR GenericResp status=$status")
+        log("CONDOR GenericResp JSON=$jsonText")
+
+        if (status != 0) {
+            log("CONDOR request failed with status=$status")
+
+            // A single unsupported/failed port must not abort the complete
+            // discovery. Continue with the next known item.
+            val gatt = bluetoothGatt
+            when (condorPendingRequest) {
+                CondorPendingRequest.GET_PROPS -> {
+                    condorPendingRequest = CondorPendingRequest.NONE
+                    if (gatt != null && isGattConnected) {
+                        handler.postDelayed({
+                            requestNextCondorProps(gatt)
+                        }, 250)
+                    }
+                }
+
+                CondorPendingRequest.GET_PORTS -> {
+                    condorPendingRequest = CondorPendingRequest.NONE
+                    if (gatt != null && isGattConnected) {
+                        requestNextCondorProduct()
+                    }
+                }
+
+                CondorPendingRequest.GET_PRODUCTS -> {
+                    condorPendingRequest = CondorPendingRequest.NONE
+                    condorDiscoveryActive = false
+                    updateStatus("Condor discovery selhala")
+                }
+
+                CondorPendingRequest.NONE -> {
+                    condorPendingRequest = CondorPendingRequest.NONE
+                }
+            }
+            return
+        }
+
+        when (condorPendingRequest) {
+            CondorPendingRequest.GET_PRODUCTS -> {
+                parseCondorProductsResponse(jsonText)
+            }
+
+            CondorPendingRequest.GET_PORTS -> {
+                parseCondorPortsResponse(jsonText)
+            }
+
+            CondorPendingRequest.GET_PROPS -> {
+                val productId = condorCurrentProductId ?: "<unknown>"
+                val port = condorCurrentPort ?: "<unknown>"
+
+                log(
+                    "CONDOR PROPS [$productId / $port]"
+                )
+                log("CONDOR PROPS JSON=$jsonText")
+
+                // Keep a compact copy for the final discovery summary.
+                condorDiscoveredProps +=
+                    "$productId / $port -> $jsonText"
+
+                // Also print individual JSON properties. This makes it much
+                // easier to spot battery/session/statistics fields in the log.
+                try {
+                    val props = JSONObject(jsonText)
+                    val keys = props.keys()
+
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        log(
+                            "  PROP $key = ${props.opt(key)}"
+                        )
+                    }
+                } catch (e: Exception) {
+                    log(
+                        "CONDOR GetProps JSON is not an object: " +
+                            "${e.message}"
+                    )
+                }
+
+                condorPendingRequest = CondorPendingRequest.NONE
+
+                val gatt = bluetoothGatt
+                if (gatt != null && isGattConnected) {
+                    handler.postDelayed({
+                        requestNextCondorProps(gatt)
+                    }, 250)
+                }
+            }
+
+            CondorPendingRequest.NONE -> {
+                log("CONDOR GenericResp received without pending request")
+            }
+        }
+    }
+
+    private fun parseCondorProductsResponse(jsonText: String) {
+        try {
+            val obj = JSONObject(jsonText)
+            condorProductIds.clear()
+
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                condorProductIds += keys.next()
+            }
+
+            // Numeric product IDs are expected here. Sorting keeps the
+            // discovery order stable between runs.
+            condorProductIds.sortWith(compareBy<String> {
+                it.toIntOrNull() ?: Int.MAX_VALUE
+            }.thenBy { it })
+
+            log("CONDOR PRODUCTS COUNT=${condorProductIds.size}")
+            for (productId in condorProductIds) {
+                val product = obj.optJSONObject(productId)
+                log(
+                    "  PRODUCT $productId: " +
+                        (product?.optString("name", "<no name>") ?: "<no name>")
+                )
+            }
+
+            if (condorProductIds.isEmpty()) {
+                log("CONDOR: no product IDs returned")
+                condorPendingRequest = CondorPendingRequest.NONE
+                condorDiscoveryActive = false
+                return
+            }
+
+            condorProductIndex = 0
+            val gatt = bluetoothGatt
+            if (gatt == null || !isGattConnected) {
+                log("CONDOR: GATT disappeared before GetPorts")
+                condorPendingRequest = CondorPendingRequest.NONE
+                condorDiscoveryActive = false
+                return
+            }
+
+            handler.postDelayed({
+                attemptCondorGetPorts(
+                    gatt,
+                    condorProductIds[condorProductIndex]
+                )
+            }, 250)
+        } catch (e: Exception) {
+            log("CONDOR GetProducts JSON parse failed: ${e.message}")
+            condorPendingRequest = CondorPendingRequest.NONE
+            condorDiscoveryActive = false
+        }
+    }
+
+    private fun parseCondorPortsResponse(jsonText: String) {
+        try {
+            val array = JSONArray(jsonText)
+            condorPorts.clear()
+
+            for (i in 0 until array.length()) {
+                val value = array.opt(i)
+                if (value is String && value.isNotBlank()) {
+                    condorPorts += value
+                }
+            }
+
+            condorPorts.sort()
+
+            log(
+                "CONDOR PORTS [$condorCurrentProductId] " +
+                    "COUNT=${condorPorts.size}: " +
+                    condorPorts.joinToString()
+            )
+
+            if (condorPorts.isEmpty()) {
+                log("CONDOR: no ports returned for $condorCurrentProductId")
+                requestNextCondorProduct()
+                return
+            }
+
+            condorPortIndex = 0
+            val gatt = bluetoothGatt
+            val productId = condorCurrentProductId
+
+            if (
+                gatt == null ||
+                !isGattConnected ||
+                productId == null
+            ) {
+                log("CONDOR: GATT disappeared before GetProps")
+                condorPendingRequest = CondorPendingRequest.NONE
+                condorDiscoveryActive = false
+                return
+            }
+
+            handler.postDelayed({
+                attemptCondorGetProps(
+                    gatt,
+                    productId,
+                    condorPorts[condorPortIndex]
+                )
+            }, 250)
+        } catch (e: Exception) {
+            log("CONDOR GetPorts JSON parse failed: ${e.message}")
+            requestNextCondorProduct()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestNextCondorProps(gatt: BluetoothGatt) {
+        condorPortIndex++
+
+        if (condorPortIndex < condorPorts.size) {
+            val productId = condorCurrentProductId ?: return
+            attemptCondorGetProps(
+                gatt,
+                productId,
+                condorPorts[condorPortIndex]
+            )
+            return
+        }
+
+        requestNextCondorProduct()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestNextCondorProduct() {
+        condorProductIndex++
+
+        if (condorProductIndex < condorProductIds.size) {
+            val gatt = bluetoothGatt ?: return
+            attemptCondorGetPorts(
+                gatt,
+                condorProductIds[condorProductIndex]
+            )
+            return
+        }
+
+        condorPendingRequest = CondorPendingRequest.NONE
+        condorDiscoveryActive = false
+
+        log("")
+        log("=== CONDOR PRODUCT/PORT DISCOVERY COMPLETE ===")
+        log(
+            "Discovered products=${condorProductIds.size}, " +
+                "successful GetProps=${condorDiscoveredProps.size}"
+        )
+
+        if (condorDiscoveredProps.isNotEmpty()) {
+            log("=== CONDOR DISCOVERY SUMMARY ===")
+            for (entry in condorDiscoveredProps) {
+                log(entry)
+            }
+        } else {
+            log("CONDOR: no successful GetProps responses")
+        }
+
+        updateStatus("Condor discovery dokončena")
     }
 
     private fun condorMessageTypeName(
@@ -1963,6 +2915,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         bluetoothGatt = null
+        gattConnectInProgress = false
 
         super.onDestroy()
     }
