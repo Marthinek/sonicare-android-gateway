@@ -26,6 +26,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import cz.marthas.sonicareble.condor.CondorProtocol
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -67,19 +68,6 @@ class MainActivity : AppCompatActivity() {
         private val CCCD_UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        // Condor framed protocol message types
-        private const val CONDOR_MSG_INITIALIZE_REQ = 1
-        private const val CONDOR_MSG_INITIALIZE_RESP = 2
-        private const val CONDOR_MSG_PUT_PROPS = 3
-        private const val CONDOR_MSG_GET_PROPS = 4
-        private const val CONDOR_MSG_SUBSCRIBE = 5
-        private const val CONDOR_MSG_UNSUBSCRIBE = 6
-        private const val CONDOR_MSG_GENERIC_RESP = 7
-        private const val CONDOR_MSG_GET_PRODUCTS = 10
-        private const val CONDOR_MSG_GET_PORTS = 11
-
-        // 1-byte transport header: low 6 bits are sequence number.
-        private const val CONDOR_SEQ_MASK = 0x3F
 
         private val DEVICE_INFORMATION_SERVICE_UUID =
             UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb")
@@ -174,7 +162,8 @@ class MainActivity : AppCompatActivity() {
         NONE,
         GET_PRODUCTS,
         GET_PORTS,
-        GET_PROPS
+        GET_PROPS,
+        SUBSCRIBE
     }
 
     private var condorPendingRequest = CondorPendingRequest.NONE
@@ -185,6 +174,8 @@ class MainActivity : AppCompatActivity() {
     private var condorCurrentProductId: String? = null
     private var condorCurrentPort: String? = null
     private var condorDiscoveryActive = false
+    private var condorSubscribeIndex = 0
+    private val condorSubscribedPorts = mutableListOf<Pair<String, String>>()
 
     // Human-readable record of every successful GetProps response.
     private val condorDiscoveredProps = mutableListOf<String>()
@@ -1710,14 +1701,7 @@ class MainActivity : AppCompatActivity() {
         log("")
         log("=== CONDOR INITIALIZE REQUEST ===")
 
-        val frame =
-            byteArrayOf(
-                0xFE.toByte(),
-                0xFF.toByte(),
-                CONDOR_MSG_INITIALIZE_REQ.toByte(),
-                0x00,
-                0x00
-            )
+        val frame = CondorProtocol.initializeReq()
 
         log("Frame HEX: ${bytesToHex(frame)}")
         log("Frame type: 1 (InitializeReq)")
@@ -1758,14 +1742,7 @@ class MainActivity : AppCompatActivity() {
         log("Message type: 10 (GetProducts)")
         log("Body length: 0")
 
-        val frame =
-            byteArrayOf(
-                0xFE.toByte(),
-                0xFF.toByte(),
-                CONDOR_MSG_GET_PRODUCTS.toByte(),
-                0x00,
-                0x00
-            )
+        val frame = CondorProtocol.getProductsReq()
 
         log("Frame HEX: ${bytesToHex(frame)}")
         log("Transport sequence start: $condorNextTxSeq")
@@ -1783,7 +1760,7 @@ class MainActivity : AppCompatActivity() {
         condorCurrentProductId = productId
 
         val body = productId.toByteArray(Charsets.US_ASCII) + byteArrayOf(0x00)
-        val frame = buildCondorFrame(CONDOR_MSG_GET_PORTS, body)
+        val frame = CondorProtocol.getPortsReq(productId)
 
         log("")
         log("=== CONDOR GET PORTS REQUEST ===")
@@ -1814,7 +1791,7 @@ class MainActivity : AppCompatActivity() {
                 port.toByteArray(Charsets.US_ASCII) +
                 byteArrayOf(0x00)
 
-        val frame = buildCondorFrame(CONDOR_MSG_GET_PROPS, body)
+        val frame = CondorProtocol.getPropsReq(productId, port)
 
         log("")
         log("=== CONDOR GET PROPS REQUEST ===")
@@ -1828,20 +1805,6 @@ class MainActivity : AppCompatActivity() {
 
         sendCondorFrame(gatt, frame)
         updateStatus("Condor GetProps: $productId / $port")
-    }
-
-    private fun buildCondorFrame(
-        messageType: Int,
-        body: ByteArray
-    ): ByteArray {
-        val frame = ByteArray(5 + body.size)
-        frame[0] = 0xFE.toByte()
-        frame[1] = 0xFF.toByte()
-        frame[2] = messageType.toByte()
-        frame[3] = ((body.size shr 8) and 0xFF).toByte()
-        frame[4] = (body.size and 0xFF).toByte()
-        body.copyInto(frame, 5)
-        return frame
     }
 
     @SuppressLint("MissingPermission")
@@ -1971,7 +1934,7 @@ class MainActivity : AppCompatActivity() {
             )
 
         val seq =
-            condorNextTxSeq and CONDOR_SEQ_MASK
+            condorNextTxSeq and CondorProtocol.SEQ_MASK
 
         val packet =
             byteArrayOf(seq.toByte()) + chunk
@@ -2038,7 +2001,7 @@ class MainActivity : AppCompatActivity() {
             // the Condor sequence and remember that this exact fragment is
             // waiting for onCharacteristicWrite().
             condorNextTxSeq =
-                (condorNextTxSeq + 1) and CONDOR_SEQ_MASK
+                (condorNextTxSeq + 1) and CondorProtocol.SEQ_MASK
 
             condorTxActiveOffset = end
             condorTxWriteInFlight = true
@@ -2140,7 +2103,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val seq =
-            value[0].toInt() and CONDOR_SEQ_MASK
+            value[0].toInt() and CondorProtocol.SEQ_MASK
 
         val payload =
             value.copyOfRange(
@@ -2202,7 +2165,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val ackByte: Byte =
-            (seq.toInt() and CONDOR_SEQ_MASK).toByte()
+            (seq.toInt() and CondorProtocol.SEQ_MASK).toByte()
 
         val ack =
             byteArrayOf(
@@ -2323,15 +2286,19 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (
-                msgType == CONDOR_MSG_INITIALIZE_RESP ||
-                msgType == CONDOR_MSG_GENERIC_RESP
+                msgType == CondorProtocol.MSG_INITIALIZE_RESP ||
+                msgType == CondorProtocol.MSG_GENERIC_RESP
             ) {
                 parseCondorResponseBody(body)
             }
 
+            if (msgType == CondorProtocol.MSG_CHANGE_IND) {
+                handleCondorChangeIndication(body)
+            }
+
             if (
                 condorStage == 8 &&
-                msgType == CONDOR_MSG_INITIALIZE_RESP
+                msgType == CondorProtocol.MSG_INITIALIZE_RESP
             ) {
                 log(
                     "CONDOR InitializeResp received - " +
@@ -2348,10 +2315,30 @@ class MainActivity : AppCompatActivity() {
                     }
                 }, 250)
             } else if (
-                msgType == CONDOR_MSG_GENERIC_RESP
+                msgType == CondorProtocol.MSG_GENERIC_RESP
             ) {
                 handleCondorGenericResponse(body)
             }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleCondorChangeIndication(body: ByteArray) {
+        log("")
+        log("=== CONDOR CHANGE INDICATION ===")
+        log("Body HEX=${bytesToHex(body)}")
+        val ascii = bytesToAscii(body)
+        if (ascii.isNotBlank()) log("Body ASCII=$ascii")
+
+        // The upstream implementation ACKs every ChangeIndication with
+        // MSG_CHANGE_IND_RESP and the exact two-byte payload 00 00.
+        val gatt = bluetoothGatt
+        if (gatt != null && isGattConnected) {
+            val ack = CondorProtocol.changeIndicationAck()
+            log("CONDOR ChangeIndication ACK frame HEX=${bytesToHex(ack)}")
+            sendCondorFrame(gatt, ack)
+        } else {
+            log("CONDOR ChangeIndication ACK skipped: GATT disconnected")
         }
     }
 
@@ -2403,6 +2390,14 @@ class MainActivity : AppCompatActivity() {
                     updateStatus("Condor discovery selhala")
                 }
 
+                CondorPendingRequest.SUBSCRIBE -> {
+                    log("CONDOR SUBSCRIBE declined: ${condorCurrentProductId}/${condorCurrentPort}")
+                    condorSubscribeIndex++
+                    if (gatt != null && isGattConnected) {
+                        handler.postDelayed({ requestNextCondorSubscription(gatt) }, 150)
+                    }
+                }
+
                 CondorPendingRequest.NONE -> {
                     condorPendingRequest = CondorPendingRequest.NONE
                 }
@@ -2417,6 +2412,19 @@ class MainActivity : AppCompatActivity() {
 
             CondorPendingRequest.GET_PORTS -> {
                 parseCondorPortsResponse(jsonText)
+            }
+
+            CondorPendingRequest.SUBSCRIBE -> {
+                val productId = condorCurrentProductId ?: "<unknown>"
+                val port = condorCurrentPort ?: "<unknown>"
+                condorSubscribedPorts += productId to port
+                log("CONDOR SUBSCRIBE OK: $productId / $port")
+                condorPendingRequest = CondorPendingRequest.NONE
+                condorSubscribeIndex++
+                val gatt = bluetoothGatt
+                if (gatt != null && isGattConnected) {
+                    handler.postDelayed({ requestNextCondorSubscription(gatt) }, 150)
+                }
             }
 
             CondorPendingRequest.GET_PROPS -> {
@@ -2502,17 +2510,19 @@ class MainActivity : AppCompatActivity() {
             condorProductIndex = 0
             val gatt = bluetoothGatt
             if (gatt == null || !isGattConnected) {
-                log("CONDOR: GATT disappeared before GetPorts")
+                log("CONDOR: GATT disappeared before live subscriptions")
                 condorPendingRequest = CondorPendingRequest.NONE
                 condorDiscoveryActive = false
                 return
             }
 
+            // IMPORTANT: Subscribe first. The upstream implementation
+            // establishes the long-lived Condor subscriptions immediately
+            // after GetProducts, before walking through GetPorts/GetProps.
+            // This is also the behavior we want to test against the
+            // toothbrush's ~20 second idle sleep.
             handler.postDelayed({
-                attemptCondorGetPorts(
-                    gatt,
-                    condorProductIds[condorProductIndex]
-                )
+                startCondorLiveSubscriptions(gatt)
             }, 250)
         } catch (e: Exception) {
             log("CONDOR GetProducts JSON parse failed: ${e.message}")
@@ -2624,27 +2634,81 @@ class MainActivity : AppCompatActivity() {
             log("CONDOR: no successful GetProps responses")
         }
 
-        updateStatus("Condor discovery dokončena")
-    }
-
-    private fun condorMessageTypeName(
-        type: Int
-    ): String {
-        return when (type) {
-            1 -> "InitializeReq"
-            2 -> "InitializeResp"
-            3 -> "PutProps"
-            4 -> "GetProps"
-            5 -> "Subscribe"
-            6 -> "Unsubscribe"
-            7 -> "GenericResp"
-            8 -> "ChangeIndication"
-            9 -> "ChangeIndicationResponse"
-            10 -> "GetProducts"
-            11 -> "GetPorts"
-            else -> "Unknown"
+        val gatt = bluetoothGatt
+        if (gatt != null && isGattConnected) {
+            // Live subscriptions are intentionally started earlier, directly
+            // after GetProducts. Reaching this point now means discovery is
+            // complete and the long-lived subscriptions are already active.
+            log("CONDOR: live subscriptions were established before discovery")
+            updateStatus("Condor discovery dokončena; live subscriptions aktivní")
+        } else {
+            log("CONDOR: GATT disappeared after discovery")
+            updateStatus("Condor discovery dokončena")
         }
     }
+
+    @SuppressLint("MissingPermission")
+    private fun startCondorLiveSubscriptions(gatt: BluetoothGatt) {
+        condorSubscribeIndex = 0
+        condorSubscribedPorts.clear()
+
+        log("")
+        log("=== CONDOR LIVE SUBSCRIPTIONS ===")
+        log("Using ${CondorProtocol.DEFAULT_SUBSCRIBE_PORTS.size} default live port subscriptions")
+        requestNextCondorSubscription(gatt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestNextCondorSubscription(gatt: BluetoothGatt) {
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR SUBSCRIBE: GATT disappeared")
+            return
+        }
+
+        if (condorSubscribeIndex >= CondorProtocol.DEFAULT_SUBSCRIBE_PORTS.size) {
+            condorPendingRequest = CondorPendingRequest.NONE
+                log("=== CONDOR LIVE SUBSCRIPTIONS COMPLETE ===")
+            log("Subscribed ports=${condorSubscribedPorts.size}")
+            for ((product, port) in condorSubscribedPorts) {
+                log("  SUBSCRIBED $product / $port")
+            }
+
+            // Subscriptions are now active. Continue with the existing
+            // product -> port -> properties discovery sequence.
+            val nextGatt = bluetoothGatt
+            if (nextGatt != null && isGattConnected && condorProductIds.isNotEmpty()) {
+                condorDiscoveryActive = true
+                condorProductIndex = 0
+                handler.postDelayed({
+                    attemptCondorGetPorts(
+                        nextGatt,
+                        condorProductIds[condorProductIndex]
+                    )
+                }, 250)
+            } else {
+                condorPendingRequest = CondorPendingRequest.NONE
+                updateStatus("Condor live subscriptions aktivní")
+            }
+            return
+        }
+
+        val (productId, port) = CondorProtocol.DEFAULT_SUBSCRIBE_PORTS[condorSubscribeIndex]
+        condorCurrentProductId = productId
+        condorCurrentPort = port
+        condorPendingRequest = CondorPendingRequest.SUBSCRIBE
+
+        val frame = CondorProtocol.subscribeReq(productId, port)
+        log("")
+        log("=== CONDOR SUBSCRIBE REQUEST ===")
+        log("Product ID: $productId")
+        log("Port: $port")
+        log("Timeout: ${CondorProtocol.SUBSCRIBE_TIMEOUT_SECS} seconds")
+        log("Body/frame HEX=${bytesToHex(frame)}")
+        sendCondorFrame(gatt, frame)
+    }
+
+    private fun condorMessageTypeName(type: Int): String =
+        CondorProtocol.messageTypeName(type)
 
     private fun parseCondorResponseBody(
         body: ByteArray
