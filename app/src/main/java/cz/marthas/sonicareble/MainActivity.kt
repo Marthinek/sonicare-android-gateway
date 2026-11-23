@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
@@ -16,18 +17,29 @@ import android.bluetooth.le.ScanSettings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.os.Environment
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.provider.MediaStore
 import androidx.appcompat.app.AppCompatActivity
 import cz.marthas.sonicareble.condor.CondorProtocol
 import java.text.SimpleDateFormat
+import java.io.BufferedWriter
+import java.io.OutputStreamWriter
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -38,6 +50,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
+        private const val APP_VERSION = "0.1.33"
 
         private const val PERMISSION_REQUEST_CODE = 1001
 
@@ -93,8 +106,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logView: TextView
     private lateinit var statusView: TextView
 
+    // Full diagnostic log is written continuously to the phone storage so
+    // long brushing sessions are not lost because of clipboard size limits.
+    private val logFileExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var logFileWriter: BufferedWriter? = null
+    private var logFileDisplayName: String = ""
+    private var logFileUri: android.net.Uri? = null
+
     private var selectedDevice: BluetoothDevice? = null
     private var isScanning = false
+
+    // Automatic foreground mode: keep looking for the Sonicare after launch
+    // and reconnect after the toothbrush drops the idle BLE connection.
+    private val autoConnectEnabled = true
+    private val autoScanRetryDelayMs = 10_000L
+    private var manualDisconnectRequested = false
+    private val autoScanRestartRunnable = Runnable {
+        if (autoConnectEnabled && !isGattConnected && !gattConnectInProgress && !isScanning) {
+            log("AUTO: restarting BLE scan")
+            startScan()
+        }
+    }
 
     /*
      * Condor V4 handshake state.
@@ -125,6 +157,56 @@ class MainActivity : AppCompatActivity() {
     private var condorNextTxSeq = 1
     private var condorRxFrameBuffer = ByteArray(0)
 
+    // Condor notifications can occasionally be delivered more than once by
+    // the Android BLE stack. The upstream implementation treats an identical
+    // delivery within 100 ms as a host-side duplicate: ACK it only once and
+    // never append its payload to the frame buffer twice. An identical packet
+    // arriving after 100 ms is treated as a genuine device resend and is ACKed
+    // again, but still must not be reassembled twice.
+    private var condorLastTxNotificationValue: ByteArray? = null
+    private var condorLastTxNotificationAtMs = 0L
+    private var condorTxNotificationCopiesDropped = 0
+    private var condorTxNotificationResends = 0
+    private val condorTxNotificationCopyWindowMs = 100L
+
+    // Passive diagnostic timing. This watchdog never sends BLE traffic.
+    // It only records whether the GATT connection is still alive and how
+    // long it has been since the last Condor notification.
+    private var condorLastActivityAtMs = 0L
+    private var condorIdleWatchdogRunning = false
+    private val condorIdleWatchdogIntervalMs = 5_000L
+    private val condorIdleWatchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!condorIdleWatchdogRunning) {
+                return
+            }
+
+            if (isGattConnected && bluetoothGatt != null) {
+                val now = SystemClock.elapsedRealtime()
+                val idleMs =
+                    if (condorLastActivityAtMs == 0L) {
+                        -1L
+                    } else {
+                        now - condorLastActivityAtMs
+                    }
+
+                log(
+                    "CONDOR IDLE WATCHDOG: connected=true; " +
+                        "subscribed=${condorSubscribedPorts.size}; " +
+                        "pending=${condorPendingRequest}; " +
+                        "lastActivityMs=$idleMs"
+                )
+            } else {
+                log("CONDOR IDLE WATCHDOG: connected=false")
+            }
+
+            handler.postDelayed(
+                this,
+                condorIdleWatchdogIntervalMs
+            )
+        }
+    }
+
     // Android GATT writes must be paced one operation at a time. The original
     // implementation sent all Condor fragments back-to-back, which can make
     // Android reject the second WRITE_NO_RESPONSE with GATT error 201.
@@ -137,22 +219,68 @@ class MainActivity : AppCompatActivity() {
     private var condorTxActiveFrame: ByteArray? = null
     private var condorTxActiveOffset = 0
     private var condorTxWriteInFlight = false
+
+    // Serialize ALL Condor characteristic writes through one Android GATT queue.
+    // e50b0001 (RX frame) and e50b0004 (TX transport ACK) otherwise race each
+    // other and Android can return ERROR_GATT_WRITE_REQUEST_BUSY (201).
+    private enum class CondorGattWriteKind {
+        RX_FRAME,
+        TX_ACK
+    }
+
+    private data class CondorGattWriteOp(
+        val kind: CondorGattWriteKind,
+        val characteristicUuid: UUID,
+        val value: ByteArray,
+        val description: String,
+        val frameEndOffset: Int = 0,
+        val frameSeq: Int = -1,
+        var retryCount: Int = 0
+    )
+
+    private val condorGattWriteQueue =
+        java.util.ArrayDeque<CondorGattWriteOp>()
+
+    private var condorGattWriteInFlight: CondorGattWriteOp? = null
+    private var condorGattWriteRetryScheduled = false
+    private val condorGattWriteRetryDelayMs = 75L
+    private val condorGattWriteMaxBusyRetries = 20
+
+    // RX_FRAME writes use 100 ms pacing as a diagnostic experiment to
+    // reduce Android GATT write congestion. TX_ACK writes bypass this
+    // pacing because Condor requires prompt transport acknowledgements.
+    private var condorGattWritePacingScheduled = false
+    private val condorGattWritePacingDelayMs = 100L
+    private var condorGattWriteBusyCount = 0
+
+    // Short rolling history of the last GATT operations. This is diagnostic
+    // only: it does not change timing or protocol behavior. It lets us see
+    // exactly what Android accepted immediately before a GATT 257 disconnect.
+    private val condorGattHistory = ArrayDeque<String>()
+    private val condorGattHistoryMaxEntries = 30
+
     private val condorTxWriteTimeoutMs = 5_000L
     private val condorTxWriteTimeoutRunnable = Runnable {
         val gatt = bluetoothGatt
-        if (condorTxWriteInFlight && gatt != null) {
+        val op = condorGattWriteInFlight
+
+        if (op != null && gatt != null) {
             log(
-                "CONDOR TX WRITE TIMEOUT after ${condorTxWriteTimeoutMs} ms; " +
-                    "BLE write callback did not arrive"
+                "CONDOR GATT WRITE TIMEOUT after " +
+                    "${condorTxWriteTimeoutMs} ms; " +
+                    "callback did not arrive for ${op.description}"
             )
-            log(
-                "CONDOR TX: aborting current frame to avoid sending " +
-                    "fragments out of order"
-            )
+
+            condorGattWriteInFlight = null
             condorTxWriteInFlight = false
             condorTxActiveFrame = null
             condorTxActiveOffset = 0
             condorTxFrameQueue.clear()
+            condorGattWriteQueue.clear()
+
+            log(
+                "CONDOR GATT WRITE: cleared write queue after timeout"
+            )
         }
     }
 
@@ -174,13 +302,56 @@ class MainActivity : AppCompatActivity() {
     private var condorCurrentProductId: String? = null
     private var condorCurrentPort: String? = null
     private var condorDiscoveryActive = false
+
+    // Diagnostic 15-second idle keep-alive. This deliberately uses a normal
+    // Condor GetProps request instead of inventing a new protocol command.
+    // The request is sent only after discovery is complete and is handled
+    // separately from the discovery state machine.
+    private var condorIdleKeepAlivePending = false
+    private var condorIdleKeepAliveCount = 0
+    private var condorIdleKeepAliveLastResponseAtMs = 0L
+private var condorDiagLastTxNotificationAtMs = 0L
+    private var condorDiagLastTxNotificationHex = ""
+    private var condorDiagLastChangeIndicationAtMs = 0L
+    private var condorDiagLastChangeIndicationHex = ""
+    private var condorDiagLastChangeIndicationAckAtMs = 0L
+    private var condorDiagLastSuccessfulGattWriteAtMs = 0L
+    private var condorDiagLastSuccessfulGattWriteDescription = ""
+    private var condorDiagLastGattBusyAtMs = 0L
+    private var condorDiagLastGattBusyDescription = ""
+    private var condorDiagLastGattCallbackAtMs = 0L
+    private var condorDiagLastGattCallbackStatus = -1
+    private var condorDiagLastGattCallbackState = -1
+    private var condorDiagGattBusyTotal = 0
+    private var condorDiagLastGenericRespAtMs = 0L
+    private var condorDiagLastGenericRespSummary = ""
+    private var condorDiagLastBleNotificationAtMs = 0L
+    private var condorDiagLastBleNotificationUuid = ""
+
+    // Diagnostic mode: probe the link every 5 seconds. The previous 15-second
+    // interval allowed the toothbrush to remain quiet for long enough that we
+    // could not tell whether the 257 disconnect happened because of that idle
+    // period or immediately after the brush accepted a request.
+    private val condorIdleKeepAliveIntervalMs = 5_000L
+    private val condorIdleKeepAliveRunnable = object : Runnable {
+        override fun run() {
+            val gatt = bluetoothGatt
+            if (gatt != null && isGattConnected) {
+                sendCondorIdleKeepAlive(gatt)
+            } else {
+                log("CONDOR IDLE KEEPALIVE: skipped; GATT disconnected")
+            }
+        }
+    }
+
     private var condorSubscribeIndex = 0
     private val condorSubscribedPorts = mutableListOf<Pair<String, String>>()
 
     // Human-readable record of every successful GetProps response.
     private val condorDiscoveredProps = mutableListOf<String>()
 
-    private val scanDurationMs = 30_000L
+    private val scanDurationMs = 5_000L
+    private val scanPauseDurationMs = 10_000L
 
     private val timeFormat =
         SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
@@ -255,6 +426,16 @@ class MainActivity : AppCompatActivity() {
                         "Nalezeno: ${name ?: "Philips Sonicare"} " +
                             "(${device.address})"
                     )
+
+                    if (autoConnectEnabled &&
+                        bluetoothGatt == null &&
+                        !gattConnectInProgress
+                    ) {
+                        log("AUTO: Sonicare found -> starting GATT connect")
+                        handler.post {
+                            connectSelectedDevice()
+                        }
+                    }
                 }
             }
 
@@ -296,8 +477,26 @@ class MainActivity : AppCompatActivity() {
         bleScanner = bluetoothAdapter.bluetoothLeScanner
 
         requestBlePermissionsIfNeeded()
+        initLogFile()
+        if (logFileDisplayName.isNotBlank()) {
+            log("LOG FILE: Downloads/SonicareBleDiagnostic/$logFileDisplayName")
+        } else {
+            log("LOG FILE: unable to create diagnostic log file")
+        }
 
-        log("=== SONICARE BLE DIAGNOSTIC v0.1.16 ===")
+        if (autoConnectEnabled && blePermissionsGranted()) {
+            log("AUTO: enabled -> starting BLE scan")
+            handler.post {
+                if (!isGattConnected && !gattConnectInProgress && !isScanning) {
+                    startScan()
+                }
+            }
+        } else if (autoConnectEnabled) {
+            log("AUTO: waiting for BLE permissions")
+        }
+
+        log("=== SONICARE BLE DIAGNOSTIC v$APP_VERSION ===")
+        log("Scanner version=$APP_VERSION")
         log("Android SDK=${Build.VERSION.SDK_INT}")
         log("Device=${Build.MODEL}")
         log("Manufacturer=${Build.MANUFACTURER}")
@@ -317,6 +516,19 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(
             statusView,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        val versionView = TextView(this)
+        versionView.text = "Sonicare BLE Scanner v$APP_VERSION"
+        versionView.textSize = 12f
+        versionView.setPadding(0, 4, 0, 12)
+
+        root.addView(
+            versionView,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -355,6 +567,20 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(copyButton)
 
+        val saveInfoButton = Button(this)
+        saveInfoButton.text = "Log uložený v Downloads"
+        saveInfoButton.setOnClickListener {
+            updateStatus(
+                if (logFileDisplayName.isNotBlank()) {
+                    "Log se ukládá do Downloads: $logFileDisplayName"
+                } else {
+                    "Logový soubor zatím není dostupný"
+                }
+            )
+        }
+
+        root.addView(saveInfoButton)
+
         val clearButton = Button(this)
         clearButton.text = "Vymazat log"
 
@@ -382,6 +608,15 @@ class MainActivity : AppCompatActivity() {
         )
 
         setContentView(root)
+    }
+
+    private fun blePermissionsGranted(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun requestBlePermissionsIfNeeded() {
@@ -420,6 +655,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            if (blePermissionsGranted()) {
+                log("BLE permissions granted")
+                if (autoConnectEnabled && !isGattConnected && !gattConnectInProgress && !isScanning) {
+                    log("AUTO: permissions ready -> starting BLE scan")
+                    startScan()
+                }
+            } else {
+                log("BLE permissions denied -> automatic scan disabled")
+                updateStatus("BLE oprávnění nebyla povolena")
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun startScan() {
 
@@ -436,16 +692,20 @@ class MainActivity : AppCompatActivity() {
         log("")
         log("=== BLE SCAN START ===")
 
-        updateStatus("Skenuji BLE...")
+        updateStatus("Skenuji BLE...  [Scanner v$APP_VERSION]")
 
         isScanning = true
 
         val scanSettings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
             .setReportDelay(0L)
             .build()
 
-        log("SCAN settings: LOW_LATENCY, reportDelay=0ms, duration=${scanDurationMs}ms")
+        log(
+                "SCAN settings: LOW_POWER, reportDelay=0ms, " +
+                    "duration=${scanDurationMs}ms; pause=${scanPauseDurationMs}ms; " +
+                    "bonded fallback enabled"
+            )
 
         bleScanner?.startScan(
             null,
@@ -472,6 +732,18 @@ class MainActivity : AppCompatActivity() {
                 updateStatus(
                     "Nalezeno zařízení: ${selectedDevice?.address}"
                 )
+
+                if (autoConnectEnabled &&
+                    bluetoothGatt == null &&
+                    !gattConnectInProgress
+                ) {
+                    log("AUTO: scan finished with device -> starting GATT connect")
+                    connectSelectedDevice()
+                }
+            } else if (autoConnectEnabled) {
+                updateStatus("Sonicare nenalezena – další scan za ${scanPauseDurationMs} ms")
+                log("AUTO: no Sonicare found -> waiting ${scanPauseDurationMs} ms before next scan")
+                handler.postDelayed(autoScanRestartRunnable, scanPauseDurationMs)
             } else {
                 updateStatus("Sonicare nenalezena")
             }
@@ -560,6 +832,10 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("MissingPermission")
     private fun connectSelectedDevice(autoRetry: Boolean = false) {
 
+        if (!autoRetry) {
+            manualDisconnectRequested = false
+        }
+
         val device = selectedDevice
 
         if (device == null) {
@@ -622,6 +898,8 @@ class MainActivity : AppCompatActivity() {
     private fun disconnectGatt() {
 
         log("GATT: disconnect requested")
+        manualDisconnectRequested = true
+        handler.removeCallbacks(autoScanRestartRunnable)
 
         gattConnectInProgress = false
 
@@ -648,6 +926,14 @@ class MainActivity : AppCompatActivity() {
 
                 log(
                     "GATT callback id=${System.identityHashCode(gatt)} " +
+                        "state=$newState status=$status " +
+                        "(${gattStatusName(status)})"
+                )
+                condorDiagLastGattCallbackAtMs = SystemClock.elapsedRealtime()
+                condorDiagLastGattCallbackStatus = status
+                condorDiagLastGattCallbackState = newState
+                recordCondorGattHistory(
+                    "CONNECTION_STATE id=${System.identityHashCode(gatt)} " +
                         "state=$newState status=$status " +
                         "(${gattStatusName(status)})"
                 )
@@ -689,6 +975,9 @@ class MainActivity : AppCompatActivity() {
                     condorPendingRequest = CondorPendingRequest.NONE
                     condorDiscoveryActive = false
                     condorRxFrameBuffer = ByteArray(0)
+                    resetCondorTxNotificationTracking()
+                    resetCondorGattDiagnostics()
+                    condorGattWriteBusyCount = 0
                     condorNextTxSeq = 1
                     resetCondorTxWriteQueue()
                     condorProductIds.clear()
@@ -742,9 +1031,44 @@ class MainActivity : AppCompatActivity() {
                         "CONDOR stage at disconnect=$condorStage"
                     )
 
+                    val disconnectIdleMs =
+                        if (condorLastActivityAtMs == 0L) {
+                            -1L
+                        } else {
+                            SystemClock.elapsedRealtime() - condorLastActivityAtMs
+                        }
+
+                    log(
+                        "CONDOR last activity before disconnect: " +
+                            "${if (disconnectIdleMs >= 0) "${disconnectIdleMs} ms ago" else "unknown"}"
+                    )
+
+                    log("")
+                    log("=== CONDOR DISCONNECT DIAGNOSTICS v0.1.30 ===")
+                    fun diagAge(atMs: Long): String =
+                        if (atMs == 0L) "never" else "${SystemClock.elapsedRealtime() - atMs} ms ago"
+                    log("last BLE notification: ${diagAge(condorDiagLastBleNotificationAtMs)} uuid=${condorDiagLastBleNotificationUuid.ifBlank { "none" }}")
+                    log("last Condor TX notification: ${diagAge(condorDiagLastTxNotificationAtMs)} hex=${condorDiagLastTxNotificationHex.ifBlank { "none" }}")
+                    log("last ChangeIndication: ${diagAge(condorDiagLastChangeIndicationAtMs)} hex=${condorDiagLastChangeIndicationHex.ifBlank { "none" }}")
+                    log("last ChangeIndication ACK queued: ${diagAge(condorDiagLastChangeIndicationAckAtMs)}")
+                    log("last GenericResp: ${diagAge(condorDiagLastGenericRespAtMs)} ${condorDiagLastGenericRespSummary}")
+                    log("last successful GATT write: ${diagAge(condorDiagLastSuccessfulGattWriteAtMs)} ${condorDiagLastSuccessfulGattWriteDescription}")
+                    log("last GATT BUSY 201: ${diagAge(condorDiagLastGattBusyAtMs)} ${condorDiagLastGattBusyDescription}; totalBusy=$condorDiagGattBusyTotal")
+                    log("last GATT callback: ${diagAge(condorDiagLastGattCallbackAtMs)} state=$condorDiagLastGattCallbackState status=$condorDiagLastGattCallbackStatus")
+                    log("pendingRequest=$condorPendingRequest; keepAliveCount=$condorIdleKeepAliveCount; keepAlivePending=$condorIdleKeepAlivePending")
+                    log("TX active=${condorTxActiveFrame != null}; txOffset=$condorTxActiveOffset; txQueue=${condorTxFrameQueue.size}; gattQueue=${condorGattWriteQueue.size}; gattInFlight=${condorGattWriteInFlight?.description ?: "none"}")
+                    log("txNextSeq=${condorNextTxSeq and CondorProtocol.SEQ_MASK}; rxBuffer=${condorRxFrameBuffer.size} bytes")
+                    dumpCondorGattHistory()
+
                     isGattConnected = false
                     gattConnectInProgress = false
                     condorDiscoveryActive = false
+                    condorIdleWatchdogRunning = false
+                    handler.removeCallbacks(condorIdleWatchdogRunnable)
+                    handler.removeCallbacks(condorIdleKeepAliveRunnable)
+                    condorIdleKeepAlivePending = false
+                    condorLastActivityAtMs = 0L
+                    resetCondorTxNotificationTracking()
                     resetCondorTxWriteQueue()
                     updateStatus("Odpojeno")
 
@@ -756,6 +1080,21 @@ class MainActivity : AppCompatActivity() {
                         gatt.close()
                     } catch (e: Exception) {
                         log("GATT close exception: ${e.message}")
+                    }
+
+                    // If this was a normal/idle disconnect, return to BLE scan
+                    // mode automatically. The special early GATT_ERROR retry
+                    // below gets priority and prevents two reconnect paths from
+                    // running at the same time. A user-requested disconnect
+                    // does not restart scanning.
+                    if (
+                        autoConnectEnabled &&
+                        !manualDisconnectRequested &&
+                        !(status == 257 && condorStage <= 3 && !condorEarlyConnectRetryUsed)
+                    ) {
+                        handler.removeCallbacks(autoScanRestartRunnable)
+                        log("AUTO: GATT disconnected -> scan again in ${autoScanRetryDelayMs} ms")
+                        handler.postDelayed(autoScanRestartRunnable, autoScanRetryDelayMs)
                     }
 
                     // The first connection can occasionally die with GATT_ERROR
@@ -1029,12 +1368,12 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (
-                    characteristic.uuid ==
-                    CHAR_WRITE_NR_UUID &&
-                    condorTxWriteInFlight
+                    characteristic.uuid == CHAR_WRITE_NR_UUID ||
+                    characteristic.uuid == CHAR_WRITE_CFG_UUID
                 ) {
-                    handleCondorFrameWriteCallback(
+                    handleCondorGattWriteCallback(
                         gatt,
+                        characteristic.uuid,
                         status
                     )
                 }
@@ -1080,6 +1419,8 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 log("")
+                condorLastActivityAtMs = SystemClock.elapsedRealtime()
+
                 log(
                     "=== NOTIFICATION ==="
                 )
@@ -1801,11 +2142,14 @@ class MainActivity : AppCompatActivity() {
         log("Body length: ${body.size}")
         log("Body HEX: ${bytesToHex(body)}")
         log("Frame HEX: ${bytesToHex(frame)}")
+        log("GET_PROPS PAYLOAD HEX: ${bytesToHex(body)}")
+        log("GET_PROPS FRAME HEX: ${bytesToHex(frame)}")
         log("Transport sequence start: $condorNextTxSeq")
 
         sendCondorFrame(gatt, frame)
         updateStatus("Condor GetProps: $productId / $port")
     }
+
 
     @SuppressLint("MissingPermission")
     private fun sendCondorFrame(
@@ -1818,16 +2162,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         val service = gatt.getService(CONDOR_SERVICE_UUID)
-
         if (service == null) {
             log("CONDOR service NOT FOUND")
             return
         }
 
-        val characteristic =
-            service.getCharacteristic(CHAR_WRITE_NR_UUID)
-
-        if (characteristic == null) {
+        if (service.getCharacteristic(CHAR_WRITE_NR_UUID) == null) {
             log("CONDOR RX WRITE characteristic NOT FOUND")
             return
         }
@@ -1835,14 +2175,20 @@ class MainActivity : AppCompatActivity() {
         log(
             "CONDOR TX frame queued: ${frame.size} bytes; " +
                 "BLE fragments=${((frame.size + 18) / 19)}; " +
-                "writeInFlight=$condorTxWriteInFlight"
+                "writeInFlight=$condorTxWriteInFlight; " +
+                "GATT queue=${condorGattWriteQueue.size}"
         )
 
-        // Copy the frame so callers can safely reuse their temporary ByteArray.
         condorTxFrameQueue.add(frame.copyOf())
 
-        if (!condorTxWriteInFlight && condorTxActiveFrame == null) {
+        if (
+            !condorTxWriteInFlight &&
+            condorTxActiveFrame == null &&
+            condorGattWriteQueue.isEmpty()
+        ) {
             startNextCondorTxFrame(gatt)
+        } else {
+            pumpCondorGattWriteQueue(gatt)
         }
     }
 
@@ -1855,14 +2201,10 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        if (condorTxWriteInFlight) {
-            return
-        }
+        if (condorTxWriteInFlight) return
 
         if (condorTxActiveFrame == null) {
-            if (condorTxFrameQueue.isEmpty()) {
-                return
-            }
+            if (condorTxFrameQueue.isEmpty()) return
 
             condorTxActiveFrame = condorTxFrameQueue.removeFirst()
             condorTxActiveOffset = 0
@@ -1886,12 +2228,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (condorTxWriteInFlight) {
-            log("CONDOR TX: fragment send skipped, another write is in flight")
+            log("CONDOR TX: fragment send skipped, another GATT write is in flight")
+            return
+        }
+
+        if (condorGattWriteQueue.isNotEmpty()) {
+            log(
+                "CONDOR TX: fragment not added; GATT queue has " +
+                    "${condorGattWriteQueue.size} item(s)"
+            )
             return
         }
 
         val frame = condorTxActiveFrame
-
         if (frame == null) {
             startNextCondorTxFrame(gatt)
             return
@@ -1917,9 +2266,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Channel config reported 244 bytes, but without an explicit ATT
-        // MTU exchange Android normally gives us a 20-byte BLE payload.
-        // One byte is reserved for the Condor transport sequence header.
         val maxBleWrite = 20
         val chunkPayloadSize = maxBleWrite - 1
         val end = minOf(
@@ -1933,159 +2279,604 @@ class MainActivity : AppCompatActivity() {
                 end
             )
 
+        // Do NOT advance seq/offset here. Android has not confirmed the write
+        // yet. They advance only from onCharacteristicWrite(GATT_SUCCESS).
         val seq =
             condorNextTxSeq and CondorProtocol.SEQ_MASK
 
         val packet =
             byteArrayOf(seq.toByte()) + chunk
 
+        val op = CondorGattWriteOp(
+            kind = CondorGattWriteKind.RX_FRAME,
+            characteristicUuid = CHAR_WRITE_NR_UUID,
+            value = packet,
+            description =
+                "RX_FRAME seq=$seq " +
+                    "offset=$condorTxActiveOffset..${end - 1} " +
+                    "${end}/${frame.size}",
+            frameEndOffset = end,
+            frameSeq = seq
+        )
+
         log(
-            "CONDOR RX TX packet: " +
-                "seq=$seq " +
-                "offset=$condorTxActiveOffset..${end - 1} " +
-                "${end}/${frame.size} bytes " +
+            "CONDOR RX TX packet queued: ${op.description} " +
                 "HEX=${bytesToHex(packet)}"
         )
 
-        try {
-            val accepted: Boolean
+        // TX_ACK packets have strict priority over queued RX_FRAME packets.
+        // This prevents a pending application frame from delaying an ACK.
+        if (op.kind == CondorGattWriteKind.TX_ACK) {
+            val firstRxFrame = condorGattWriteQueue.indexOfFirst {
+                it.kind == CondorGattWriteKind.RX_FRAME
+            }
 
+            if (firstRxFrame >= 0) {
+                val queueList = condorGattWriteQueue.toMutableList()
+                queueList.add(firstRxFrame, op)
+                condorGattWriteQueue.clear()
+                condorGattWriteQueue.addAll(queueList)
+            } else {
+                condorGattWriteQueue.addLast(op)
+            }
+        } else {
+            condorGattWriteQueue.addLast(op)
+        }
+
+        pumpCondorGattWriteQueue(gatt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pumpCondorGattWriteQueue(
+        gatt: BluetoothGatt
+    ) {
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR GATT WRITE: pump aborted, GATT disconnected")
+            return
+        }
+
+        if (
+            condorGattWriteInFlight != null ||
+            condorGattWriteRetryScheduled
+        ) {
+            return
+        }
+
+        val op = condorGattWriteQueue.peekFirst() ?: return
+
+        val service = gatt.getService(CONDOR_SERVICE_UUID)
+        val characteristic =
+            service?.getCharacteristic(op.characteristicUuid)
+
+        if (characteristic == null) {
+            log(
+                "CONDOR GATT WRITE: characteristic not found: " +
+                    op.characteristicUuid
+            )
+            condorGattWriteQueue.removeFirst()
+            handleCondorGattWriteFailure(gatt, op, -1)
+            return
+        }
+
+        log(
+            "CONDOR GATT WRITE START: ${op.description}; " +
+                "queue=${condorGattWriteQueue.size}; " +
+                "HEX=${bytesToHex(op.value)}"
+        )
+        recordCondorGattHistory(
+            "WRITE_START ${op.description} queue=${condorGattWriteQueue.size}"
+        )
+
+        try {
             if (Build.VERSION.SDK_INT >= 33) {
                 val result =
                     gatt.writeCharacteristic(
                         characteristic,
-                        packet,
+                        op.value,
                         BluetoothGattCharacteristic
                             .WRITE_TYPE_NO_RESPONSE
                     )
 
                 log(
-                    "writeCharacteristic API33+ returned=$result"
+                    "CONDOR GATT WRITE immediateResult=$result " +
+                        "op=${op.kind}"
+                )
+                recordCondorGattHistory(
+                    "WRITE_RESULT result=$result ${op.description}"
                 )
 
-                accepted =
-                    result == BluetoothGatt.GATT_SUCCESS
+                when (result) {
+                    BluetoothGatt.GATT_SUCCESS -> {
+                        /*
+                         * WRITE_NO_RESPONSE is different from a normal
+                         * acknowledged GATT write: Android already returned
+                         * GATT_SUCCESS, meaning the invocation was accepted.
+                         *
+                         * On the Pixel + HX741X, onCharacteristicWrite() can
+                         * arrive immediately afterwards, but it is not
+                         * reliable enough to use as the completion signal for
+                         * this WRITE_NO_RESPONSE operation. Waiting for it can
+                         * leave the Condor queue stuck for 5 seconds even though
+                         * the brush already accepted the packet.
+                         *
+                         * Therefore GATT_SUCCESS completes this local queue
+                         * operation immediately. The 201 path remains strict:
+                         * 201 means the invocation was NOT accepted, so the
+                         * exact same packet stays at the queue head and is
+                         * retried.
+                         */
+                        condorGattWriteQueue.removeFirst()
+
+                        if (op.kind == CondorGattWriteKind.RX_FRAME) {
+                            condorTxWriteInFlight = false
+
+                            condorNextTxSeq =
+                                (condorNextTxSeq + 1) and CondorProtocol.SEQ_MASK
+
+                            condorTxActiveOffset = op.frameEndOffset
+
+                            if (
+                                condorTxActiveFrame != null &&
+                                condorTxActiveOffset >=
+                                    condorTxActiveFrame!!.size
+                            ) {
+                                log(
+                                    "CONDOR TX: complete frame accepted by GATT"
+                                )
+                                condorTxActiveFrame = null
+                                condorTxActiveOffset = 0
+                            }
+                        }
+
+                        condorDiagLastSuccessfulGattWriteAtMs =
+                            SystemClock.elapsedRealtime()
+                        condorDiagLastSuccessfulGattWriteDescription =
+                            op.description
+                        recordCondorGattHistory(
+                            "WRITE_ACCEPTED ${op.description} " +
+                                "queue=${condorGattWriteQueue.size}"
+                        )
+
+                        log(
+                            "CONDOR GATT WRITE ACCEPTED: " +
+                                "${op.description}; WRITE_NO_RESPONSE " +
+                                "completed from immediateResult=0; " +
+                                "activeOffset=$condorTxActiveOffset; " +
+                                "activeFrameSize=${condorTxActiveFrame?.size ?: 0}; " +
+                                "queue=${condorGattWriteQueue.size}"
+                        )
+
+                        /*
+                         * Do not immediately issue another BLE write after
+                         * WRITE_NO_RESPONSE returned 0. The invocation was
+                         * accepted, but the Pixel/Android ATT pipeline can
+                         * still need a short moment before the next write.
+                         *
+                         * RX_FRAME continuation is intentionally paced at 100 ms in
+                         * v0.1.30, while TX_ACK operations bypass that pacing.
+                         *
+                         * A late onCharacteristicWrite() callback may still
+                         * arrive. It must not consume the next queued operation.
+                         */
+                        /*
+                         * TX_ACK is time-critical. Do not put an ACK behind
+                         * the 100 ms RX_FRAME pacing experiment.
+                         *
+                         * RX_FRAME writes remain deliberately paced to avoid
+                         * Android GATT_BUSY (201), while a queued TX_ACK is
+                         * dispatched as soon as the current write has been
+                         * accepted. This mirrors the upstream Condor rule
+                         * that every incoming TX packet must be ACKed promptly.
+                         */
+                        val nextOp = condorGattWriteQueue.peekFirst()
+
+                        if (
+                            nextOp?.kind == CondorGattWriteKind.TX_ACK &&
+                            bluetoothGatt == gatt &&
+                            isGattConnected
+                        ) {
+                            log(
+                                "CONDOR GATT WRITE: TX_ACK bypasses " +
+                                    "${condorGattWritePacingDelayMs} ms pacing"
+                            )
+                            pumpCondorGattWriteQueue(gatt)
+                        } else if (
+                            !condorGattWritePacingScheduled &&
+                            bluetoothGatt == gatt &&
+                            isGattConnected
+                        ) {
+                            condorGattWritePacingScheduled = true
+                            handler.postDelayed(
+                                condorGattWritePacingRunnable,
+                                condorGattWritePacingDelayMs
+                            )
+                            log(
+                                "CONDOR GATT WRITE: RX_FRAME next operation " +
+                                    "paced by ${condorGattWritePacingDelayMs} ms"
+                            )
+                        }
+                    }
+
+                    BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> {
+                        // 201 is NOT an accepted write. Keep the exact packet
+                        // at queue head; do not advance Condor state and do not
+                        // wait for a callback belonging to another write.
+                        op.retryCount++
+                        condorGattWriteBusyCount++
+                condorDiagGattBusyTotal++
+                condorDiagLastGattBusyAtMs = SystemClock.elapsedRealtime()
+                condorDiagLastGattBusyDescription = op.description
+
+                        recordCondorGattHistory(
+                            "WRITE_BUSY_201 ${op.description} retry=${op.retryCount}"
+                        )
+
+                        log(
+                            "CONDOR GATT WRITE BUSY (201): " +
+                                "totalBusy=$condorGattWriteBusyCount; " +
+                                "${op.description}; " +
+                                "retry ${op.retryCount}/$condorGattWriteMaxBusyRetries"
+                        )
+
+                        if (
+                            op.retryCount > condorGattWriteMaxBusyRetries
+                        ) {
+                            condorGattWriteQueue.removeFirst()
+                            handleCondorGattWriteFailure(
+                                gatt,
+                                op,
+                                BluetoothStatusCodes
+                                    .ERROR_GATT_WRITE_REQUEST_BUSY
+                            )
+                        } else {
+                            condorGattWriteRetryScheduled = true
+                            handler.postDelayed({
+                                condorGattWriteRetryScheduled = false
+                                if (
+                                    bluetoothGatt == gatt &&
+                                    isGattConnected
+                                ) {
+                                    pumpCondorGattWriteQueue(gatt)
+                                }
+                            }, condorGattWriteRetryDelayMs)
+                        }
+                    }
+
+                    else -> {
+                        condorGattWriteQueue.removeFirst()
+                        handleCondorGattWriteFailure(
+                            gatt,
+                            op,
+                            result
+                        )
+                    }
+                }
             } else {
                 @Suppress("DEPRECATION")
-                characteristic.value = packet
-
+                characteristic.value = op.value
                 characteristic.writeType =
                     BluetoothGattCharacteristic
                         .WRITE_TYPE_NO_RESPONSE
 
                 @Suppress("DEPRECATION")
-                accepted =
+                val accepted =
                     gatt.writeCharacteristic(characteristic)
 
                 log(
-                    "writeCharacteristic returned=$accepted"
+                    "CONDOR GATT WRITE legacy returned=$accepted " +
+                        "op=${op.kind}"
                 )
+
+                if (accepted) {
+                    condorGattWriteQueue.removeFirst()
+                    condorGattWriteInFlight = op
+                    condorTxWriteInFlight =
+                        op.kind == CondorGattWriteKind.RX_FRAME
+
+                    handler.removeCallbacks(
+                        condorTxWriteTimeoutRunnable
+                    )
+                    handler.postDelayed(
+                        condorTxWriteTimeoutRunnable,
+                        condorTxWriteTimeoutMs
+                    )
+                } else {
+                    condorGattWriteQueue.removeFirst()
+                    handleCondorGattWriteFailure(
+                        gatt,
+                        op,
+                        -1
+                    )
+                }
             }
-
-            if (!accepted) {
-                log(
-                    "CONDOR TX fragment rejected immediately"
-                )
-                log(
-                    "CONDOR TX: aborting current frame; " +
-                        "no subsequent fragment will be sent"
-                )
-                condorTxWriteInFlight = false
-                condorTxActiveFrame = null
-                condorTxActiveOffset = 0
-                condorTxFrameQueue.clear()
-                return
-            }
-
-            // Only now, after Android accepted the write operation, advance
-            // the Condor sequence and remember that this exact fragment is
-            // waiting for onCharacteristicWrite().
-            condorNextTxSeq =
-                (condorNextTxSeq + 1) and CondorProtocol.SEQ_MASK
-
-            condorTxActiveOffset = end
-            condorTxWriteInFlight = true
-
-            handler.removeCallbacks(condorTxWriteTimeoutRunnable)
-            handler.postDelayed(
-                condorTxWriteTimeoutRunnable,
-                condorTxWriteTimeoutMs
-            )
-
-            log(
-                "CONDOR TX: fragment accepted; waiting for " +
-                    "onCharacteristicWrite() before sending next fragment"
-            )
         } catch (e: Exception) {
             log(
-                "CONDOR FRAME WRITE EXCEPTION: " +
-                    "${e.javaClass.simpleName}: ${e.message}"
+                "CONDOR GATT WRITE EXCEPTION: " +
+                    "${e.javaClass.simpleName}: ${e.message}; " +
+                    "op=${op.description}"
             )
+            condorGattWriteQueue.removeFirst()
+            handleCondorGattWriteFailure(gatt, op, -1)
+        }
+    }
+
+    private fun handleCondorGattWriteFailure(
+        gatt: BluetoothGatt,
+        op: CondorGattWriteOp,
+        status: Int
+    ) {
+        log(
+            "CONDOR GATT WRITE FAILED: ${op.description}; " +
+                "status=$status (${gattStatusName(status)})"
+        )
+
+        if (op.kind == CondorGattWriteKind.RX_FRAME) {
             condorTxWriteInFlight = false
             condorTxActiveFrame = null
             condorTxActiveOffset = 0
             condorTxFrameQueue.clear()
+            log(
+                "CONDOR TX: aborting current frame after GATT write failure"
+            )
+        } else {
+            log(
+                "CONDOR TX_ACK write failed; RX frame state left intact"
+            )
+        }
+
+        if (bluetoothGatt == gatt && isGattConnected) {
+            pumpCondorGattWriteQueue(gatt)
         }
     }
 
-    private fun handleCondorFrameWriteCallback(
+    private fun handleCondorGattWriteCallback(
         gatt: BluetoothGatt,
+        characteristicUuid: UUID,
         status: Int
     ) {
-        handler.removeCallbacks(condorTxWriteTimeoutRunnable)
+        val op = condorGattWriteInFlight
 
-        if (!condorTxWriteInFlight) {
-            log("CONDOR TX: unexpected RX WRITE callback")
+        if (op == null) {
+            log(
+                "CONDOR GATT WRITE CALLBACK: unexpected callback; " +
+                    "uuid=$characteristicUuid status=$status " +
+                    "(${gattStatusName(status)})"
+            )
             return
         }
 
+        if (op.characteristicUuid != characteristicUuid) {
+            log(
+                "CONDOR GATT WRITE CALLBACK: UUID mismatch; " +
+                    "expected=${op.characteristicUuid} " +
+                    "actual=$characteristicUuid; status=$status"
+            )
+            return
+        }
+
+        handler.removeCallbacks(condorTxWriteTimeoutRunnable)
+        condorGattWriteInFlight = null
         condorTxWriteInFlight = false
 
         if (status != BluetoothGatt.GATT_SUCCESS) {
-            log(
-                "CONDOR TX: BLE write callback FAILED: " +
-                    "status=$status (${gattStatusName(status)})"
-            )
-            log(
-                "CONDOR TX: aborting current frame; " +
-                    "queued frames=${condorTxFrameQueue.size}"
-            )
-            condorTxActiveFrame = null
-            condorTxActiveOffset = 0
-            condorTxFrameQueue.clear()
+            handleCondorGattWriteFailure(gatt, op, status)
             return
         }
+
+        val callbackAgeMs =
+            SystemClock.elapsedRealtime() -
+                condorDiagLastSuccessfulGattWriteAtMs
 
         log(
-            "CONDOR TX: BLE write callback OK; " +
-                "fragment complete at offset=$condorTxActiveOffset"
+            "CONDOR GATT WRITE CALLBACK OK: ${op.description}"
+        )
+        recordCondorGattHistory(
+            "WRITE_CALLBACK_OK ${op.description} ageFromLastAccepted=${callbackAgeMs}ms"
         )
 
-        if (bluetoothGatt != gatt || !isGattConnected) {
-            log("CONDOR TX: callback received after GATT disconnect")
-            condorTxActiveFrame = null
-            condorTxActiveOffset = 0
-            condorTxFrameQueue.clear()
+        if (op.kind == CondorGattWriteKind.RX_FRAME) {
+            // Only now is this Condor fragment complete.
+            condorNextTxSeq =
+                (condorNextTxSeq + 1) and CondorProtocol.SEQ_MASK
+
+            condorTxActiveOffset = op.frameEndOffset
+
+            if (
+                condorTxActiveFrame != null &&
+                condorTxActiveOffset >= condorTxActiveFrame!!.size
+            ) {
+                log("CONDOR TX: complete frame sent successfully")
+                condorTxActiveFrame = null
+                condorTxActiveOffset = 0
+            }
+        }
+
+        /*
+         * A TX_ACK has priority over continuing an RX_FRAME.
+         * If an ACK is queued, dispatch it immediately.
+         * Otherwise continue the active RX frame with the 100 ms diagnostic
+         * pacing. This keeps ACK latency low without reintroducing the
+         * Android GATT write congestion we are testing.
+         */
+        if (
+            condorGattWriteQueue.peekFirst()?.kind ==
+                CondorGattWriteKind.TX_ACK
+        ) {
+            log(
+                "CONDOR GATT WRITE CALLBACK: TX_ACK queued; " +
+                    "dispatching ACK before RX_FRAME continuation"
+            )
+            pumpCondorGattWriteQueue(gatt)
+        } else if (
+            condorGattWriteQueue.isEmpty() &&
+            condorTxActiveFrame != null &&
+            !condorTxWriteInFlight
+        ) {
+            scheduleCondorRxFrameContinuation(gatt)
+        } else if (
+            condorGattWriteQueue.isEmpty() &&
+            condorTxActiveFrame == null &&
+            condorTxFrameQueue.isNotEmpty() &&
+            !condorTxWriteInFlight
+        ) {
+            scheduleCondorRxFrameStart(gatt)
+        }
+
+    }
+
+    private fun scheduleCondorRxFrameContinuation(gatt: BluetoothGatt) {
+        if (
+            condorGattWritePacingScheduled ||
+            bluetoothGatt != gatt ||
+            !isGattConnected
+        ) {
             return
         }
 
-        val frame = condorTxActiveFrame
+        condorGattWritePacingScheduled = true
+        handler.postDelayed(
+            condorGattWritePacingRunnable,
+            condorGattWritePacingDelayMs
+        )
+        log(
+            "CONDOR GATT WRITE: RX_FRAME continuation scheduled in " +
+                "${condorGattWritePacingDelayMs} ms"
+        )
+    }
 
-        if (frame != null && condorTxActiveOffset < frame.size) {
-            // IMPORTANT: do not wait for Condor RX_ACK here. The upstream
-            // implementation serializes the BLE write operation itself, then
-            // immediately sends the next fragment.
-            sendNextCondorTxFragment(gatt)
-        } else {
-            log("CONDOR TX: complete frame sent successfully")
-            condorTxActiveFrame = null
-            condorTxActiveOffset = 0
-            startNextCondorTxFrame(gatt)
+    private fun scheduleCondorRxFrameStart(gatt: BluetoothGatt) {
+        if (
+            condorGattWritePacingScheduled ||
+            bluetoothGatt != gatt ||
+            !isGattConnected
+        ) {
+            return
+        }
+
+        condorGattWritePacingScheduled = true
+        handler.postDelayed(
+            condorGattWritePacingRunnable,
+            condorGattWritePacingDelayMs
+        )
+        log(
+            "CONDOR GATT WRITE: next RX_FRAME start scheduled in " +
+                "${condorGattWritePacingDelayMs} ms"
+        )
+    }
+
+    private fun recordCondorGattHistory(message: String) {
+        val timestamp = timeFormat.format(Date())
+        condorGattHistory.addLast("[$timestamp] $message")
+        while (condorGattHistory.size > condorGattHistoryMaxEntries) {
+            condorGattHistory.removeFirst()
+        }
+    }
+
+    private fun dumpCondorGattHistory() {
+        log("=== CONDOR GATT OP HISTORY (last ${condorGattHistory.size}) ===")
+        for (entry in condorGattHistory) {
+            log(entry)
+        }
+    }
+
+    private fun resetCondorGattDiagnostics() {
+        condorDiagLastTxNotificationAtMs = 0L
+        condorDiagLastTxNotificationHex = ""
+        condorDiagLastChangeIndicationAtMs = 0L
+        condorDiagLastChangeIndicationHex = ""
+        condorDiagLastChangeIndicationAckAtMs = 0L
+        condorDiagLastSuccessfulGattWriteAtMs = 0L
+        condorDiagLastSuccessfulGattWriteDescription = ""
+        condorDiagLastGattBusyAtMs = 0L
+        condorDiagLastGattBusyDescription = ""
+        condorDiagLastGattCallbackAtMs = 0L
+        condorDiagLastGattCallbackStatus = -1
+        condorDiagLastGattCallbackState = -1
+        condorDiagGattBusyTotal = 0
+        condorDiagLastGenericRespAtMs = 0L
+        condorDiagLastGenericRespSummary = ""
+        condorDiagLastBleNotificationAtMs = 0L
+        condorDiagLastBleNotificationUuid = ""
+        condorGattHistory.clear()
+    }
+
+    private fun resetCondorTxNotificationTracking() {
+        if (
+            condorTxNotificationCopiesDropped > 0 ||
+            condorTxNotificationResends > 0
+        ) {
+            log(
+                "CONDOR TX notification tracking reset: " +
+                    "copiesDropped=$condorTxNotificationCopiesDropped, " +
+                    "resends=$condorTxNotificationResends"
+            )
+        }
+
+        condorLastTxNotificationValue = null
+        condorLastTxNotificationAtMs = 0L
+        condorTxNotificationCopiesDropped = 0
+        condorTxNotificationResends = 0
+    }
+
+    private val condorGattWritePacingRunnable = Runnable {
+        condorGattWritePacingScheduled = false
+
+        val gatt = bluetoothGatt
+        if (
+            gatt != null &&
+            isGattConnected
+        ) {
+            /*
+             * API33+ WRITE_NO_RESPONSE can complete from the immediate
+             * writeCharacteristic() result without producing a callback
+             * that we can use as the continuation signal.
+             *
+             * Therefore the pacing runnable must continue the Condor TX
+             * frame itself when the GATT queue is empty. The previous
+             * version only called pumpCondorGattWriteQueue(), which is a
+             * no-op for an empty queue. That left multi-fragment frames
+             * stranded after fragment #1.
+             *
+             * If a transport ACK is already queued, pump it first. The
+             * ACK has priority. Its own successful immediate completion
+             * will schedule another pacing pass, which then continues the
+             * active RX frame.
+             */
+            if (condorGattWriteQueue.isNotEmpty()) {
+                pumpCondorGattWriteQueue(gatt)
+            } else if (
+                condorTxActiveFrame != null &&
+                !condorTxWriteInFlight
+            ) {
+                log(
+                    "CONDOR TX PACING: continuing active frame; " +
+                        "offset=$condorTxActiveOffset/" +
+                        "${condorTxActiveFrame!!.size}; " +
+                        "nextSeq=${condorNextTxSeq and CondorProtocol.SEQ_MASK}"
+                )
+                sendNextCondorTxFragment(gatt)
+            } else if (
+                condorTxActiveFrame == null &&
+                condorTxFrameQueue.isNotEmpty() &&
+                !condorTxWriteInFlight
+            ) {
+                log(
+                    "CONDOR TX PACING: starting next queued frame; " +
+                        "queuedFrames=${condorTxFrameQueue.size}"
+                )
+                startNextCondorTxFrame(gatt)
+            }
         }
     }
 
     private fun resetCondorTxWriteQueue() {
         handler.removeCallbacks(condorTxWriteTimeoutRunnable)
+        condorGattWriteRetryScheduled = false
+        condorGattWritePacingScheduled = false
+        handler.removeCallbacks(condorGattWritePacingRunnable)
+        condorGattWriteInFlight = null
+        condorGattWriteQueue.clear()
+
         condorTxWriteInFlight = false
         condorTxActiveFrame = null
         condorTxActiveOffset = 0
@@ -2097,8 +2888,47 @@ class MainActivity : AppCompatActivity() {
         gatt: BluetoothGatt,
         value: ByteArray
     ) {
+        condorLastActivityAtMs = SystemClock.elapsedRealtime()
+
         if (value.isEmpty()) {
             log("CONDOR TX: empty notification")
+            return
+        }
+
+        /*
+         * Match the upstream Condor behavior:
+         *
+         * The Android BLE stack can deliver the same notification multiple
+         * times even though the brush sent it only once. If the bytes on
+         * e50b0003 are identical to the previous delivery within 100 ms,
+         * this is a host-side duplicate. Do not ACK it a second time and,
+         * most importantly, do not append it to the frame buffer again.
+         *
+         * If the identical packet arrives after 100 ms, treat it as a real
+         * device resend (most likely a lost TX_ACK). ACK it again, but do
+         * not reassemble the packet twice.
+         */
+        val nowMs = SystemClock.elapsedRealtime()
+        val previous = condorLastTxNotificationValue
+        val ageMs =
+            if (previous != null && previous.contentEquals(value)) {
+                nowMs - condorLastTxNotificationAtMs
+            } else {
+                -1L
+            }
+
+        condorLastTxNotificationValue = value.copyOf()
+        condorLastTxNotificationAtMs = nowMs
+
+        if (ageMs >= 0L && ageMs < condorTxNotificationCopyWindowMs) {
+            condorTxNotificationCopiesDropped++
+
+            log(
+                "CONDOR TX: duplicate notification dropped; " +
+                    "same bytes ${ageMs} ms after previous delivery; " +
+                    "copiesDropped=$condorTxNotificationCopiesDropped"
+            )
+
             return
         }
 
@@ -2116,7 +2946,21 @@ class MainActivity : AppCompatActivity() {
         log("Transport seq=$seq")
         log("Packet HEX=${bytesToHex(value)}")
 
-        // ACK every received TX transport packet on e50b0004.
+        if (ageMs >= condorTxNotificationCopyWindowMs) {
+            condorTxNotificationResends++
+
+            log(
+                "CONDOR TX: packet appears resent after ${ageMs} ms; " +
+                    "resends=$condorTxNotificationResends"
+            )
+
+            // A real resend must be ACKed again, but its payload was already
+            // accepted into the frame buffer on the first delivery.
+            sendCondorTxAck(gatt, seq)
+            return
+        }
+
+        // ACK every new TX transport packet on e50b0004.
         sendCondorTxAck(gatt, seq)
 
         if (payload.isNotEmpty()) {
@@ -2138,25 +2982,24 @@ class MainActivity : AppCompatActivity() {
         parseCondorFrames()
     }
 
+
     @SuppressLint("MissingPermission")
     private fun sendCondorTxAck(
         gatt: BluetoothGatt,
         seq: Int
     ) {
-        val service =
-            gatt.getService(CONDOR_SERVICE_UUID)
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR TX_ACK skipped: GATT disconnected")
+            return
+        }
 
+        val service = gatt.getService(CONDOR_SERVICE_UUID)
         if (service == null) {
             log("CONDOR TX_ACK: service not found")
             return
         }
 
-        val characteristic =
-            service.getCharacteristic(
-                CHAR_WRITE_CFG_UUID
-            )
-
-        if (characteristic == null) {
+        if (service.getCharacteristic(CHAR_WRITE_CFG_UUID) == null) {
             log(
                 "CONDOR TX_ACK characteristic " +
                     "e50b0004 NOT FOUND"
@@ -2164,57 +3007,44 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val ackByte: Byte =
-            (seq.toInt() and CondorProtocol.SEQ_MASK).toByte()
+        val ackByte =
+            (seq and CondorProtocol.SEQ_MASK).toByte()
 
         val ack =
-            byteArrayOf(
-                ackByte
-            )
+            byteArrayOf(ackByte)
 
-        log(
-            "CONDOR TX_ACK -> e50b0004 " +
-                "HEX=${bytesToHex(ack)}"
+        val op = CondorGattWriteOp(
+            kind = CondorGattWriteKind.TX_ACK,
+            characteristicUuid = CHAR_WRITE_CFG_UUID,
+            value = ack,
+            description =
+                "TX_ACK seq=${seq and CondorProtocol.SEQ_MASK}"
         )
 
-        try {
-            if (Build.VERSION.SDK_INT >= 33) {
-                val result =
-                    gatt.writeCharacteristic(
-                        characteristic,
-                        ack,
-                        BluetoothGattCharacteristic
-                            .WRITE_TYPE_NO_RESPONSE
-                    )
-
-                log(
-                    "TX_ACK write API33+ returned=$result"
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                characteristic.value = ack
-
-                characteristic.writeType =
-                    BluetoothGattCharacteristic
-                        .WRITE_TYPE_NO_RESPONSE
-
-                @Suppress("DEPRECATION")
-                val result =
-                    gatt.writeCharacteristic(
-                        characteristic
-                    )
-
-                log(
-                    "TX_ACK write returned=$result"
-                )
+        // ACKs share the same Android GATT queue as RX frame writes.
+        // Put them first because transport ACKs must be sent promptly.
+        if (
+            condorGattWriteQueue.any {
+                it.kind == CondorGattWriteKind.TX_ACK
             }
-        } catch (e: Exception) {
-            log(
-                "TX_ACK WRITE EXCEPTION: " +
-                    "${e.javaClass.simpleName}: " +
-                    "${e.message}"
-            )
+        ) {
+            // Keep multiple transport ACKs in arrival order.
+            condorGattWriteQueue.addLast(op)
+        } else {
+            // No queued ACK yet: put this ACK ahead of any queued RX frame.
+            condorGattWriteQueue.addFirst(op)
         }
+
+        log(
+            "TX_ACK PAYLOAD HEX: ${bytesToHex(ack)}; " +
+                "seq=${seq and CondorProtocol.SEQ_MASK}"
+        )
+        log(
+            "TX_ACK FRAME/WRITE HEX: ${bytesToHex(ack)} -> e50b0004; " +
+                "GATT queue=${condorGattWriteQueue.size}"
+        )
+
+        pumpCondorGattWriteQueue(gatt)
     }
 
     private fun parseCondorFrames() {
@@ -2325,6 +3155,8 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("MissingPermission")
     private fun handleCondorChangeIndication(body: ByteArray) {
         log("")
+        condorDiagLastChangeIndicationAtMs = SystemClock.elapsedRealtime()
+        condorDiagLastChangeIndicationHex = bytesToHex(body)
         log("=== CONDOR CHANGE INDICATION ===")
         log("Body HEX=${bytesToHex(body)}")
         val ascii = bytesToAscii(body)
@@ -2335,7 +3167,10 @@ class MainActivity : AppCompatActivity() {
         val gatt = bluetoothGatt
         if (gatt != null && isGattConnected) {
             val ack = CondorProtocol.changeIndicationAck()
-            log("CONDOR ChangeIndication ACK frame HEX=${bytesToHex(ack)}")
+            log("CHANGE_IND_RESP PAYLOAD HEX: 00 00")
+            log("CHANGE_IND_RESP FRAME HEX: ${bytesToHex(ack)}")
+            log("CHANGE_IND_RESP frame length=${ack.size} bytes")
+            condorDiagLastChangeIndicationAckAtMs = SystemClock.elapsedRealtime()
             sendCondorFrame(gatt, ack)
         } else {
             log("CONDOR ChangeIndication ACK skipped: GATT disconnected")
@@ -2358,8 +3193,49 @@ class MainActivity : AppCompatActivity() {
                 ""
             }
 
+        condorDiagLastGenericRespAtMs = SystemClock.elapsedRealtime()
+        condorDiagLastGenericRespSummary = "status=$status; json=${jsonText.take(120)}"
         log("CONDOR GenericResp status=$status")
         log("CONDOR GenericResp JSON=$jsonText")
+
+        if (condorIdleKeepAlivePending) {
+            condorIdleKeepAlivePending = false
+
+            if (status == 0) {
+                condorIdleKeepAliveLastResponseAtMs =
+                    SystemClock.elapsedRealtime()
+
+                log("CONDOR IDLE KEEPALIVE RESPONSE OK")
+                log(
+                    "CONDOR IDLE KEEPALIVE response received; " +
+                        "next probe in ${condorIdleKeepAliveIntervalMs / 1000}s"
+                )
+                if (jsonText.isNotBlank()) {
+                    try {
+                        val json = JSONObject(jsonText)
+                        val batteryPercent = json.optInt("BatteryPercent", -1)
+                        if (batteryPercent >= 0) {
+                            log("CONDOR IDLE KEEPALIVE BatteryPercent=$batteryPercent")
+                        }
+                    } catch (e: Exception) {
+                        log("CONDOR IDLE KEEPALIVE JSON parse note: ${e.message}")
+                    }
+                }
+            } else {
+                log("CONDOR IDLE KEEPALIVE RESPONSE FAILED: status=$status")
+            }
+
+            if (bluetoothGatt != null && isGattConnected) {
+                handler.postDelayed(
+                    condorIdleKeepAliveRunnable,
+                    condorIdleKeepAliveIntervalMs
+                )
+            }
+
+            // Do not let the diagnostic request enter the discovery state
+            // machine below.
+            return
+        }
 
         if (status != 0) {
             log("CONDOR request failed with status=$status")
@@ -2641,10 +3517,102 @@ class MainActivity : AppCompatActivity() {
             // complete and the long-lived subscriptions are already active.
             log("CONDOR: live subscriptions were established before discovery")
             updateStatus("Condor discovery dokončena; live subscriptions aktivní")
+
+            // v0.1.31 diagnostic run: deliberately do NOT start the
+            // artificial 5-second GetProps keep-alive. The previous runs
+            // proved that the keep-alive did not prevent the BLE ACL
+            // disconnect, and it also introduced extra traffic that was not
+            // present in the upstream Home Assistant implementation.
+            log("")
+            log("=== CONDOR IDLE KEEP-ALIVE DISABLED (v0.1.31) ===")
+            log("No artificial GetProps 1 / Battery probes will be sent")
+            log("Reason: compare a clean upstream-like idle connection")
         } else {
             log("CONDOR: GATT disappeared after discovery")
             updateStatus("Condor discovery dokončena")
         }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startCondorIdleKeepAliveDiagnostic() {
+        // Disabled in v0.1.31. Kept as a diagnostic helper so the old code
+        // remains easy to restore for a controlled comparison if needed.
+        log("CONDOR IDLE KEEP-ALIVE: DISABLED in v$APP_VERSION")
+        handler.removeCallbacks(condorIdleKeepAliveRunnable)
+        condorIdleKeepAlivePending = false
+        return
+        condorIdleKeepAliveCount = 0
+        condorIdleKeepAliveLastResponseAtMs = 0L
+
+        log("")
+        log("=== CONDOR IDLE KEEP-ALIVE DIAGNOSTIC v2 / APP v$APP_VERSION ===")
+        log("Interval: ${condorIdleKeepAliveIntervalMs / 1000} seconds")
+        log("Method: normal GetProps 1 / Battery")
+        log("Purpose: determine whether 257 occurs after a quiet interval")
+        log("IMPORTANT: this is intentionally more aggressive than v0.1.25")
+
+        handler.postDelayed(
+            condorIdleKeepAliveRunnable,
+            condorIdleKeepAliveIntervalMs
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendCondorIdleKeepAlive(gatt: BluetoothGatt) {
+        if (bluetoothGatt != gatt || !isGattConnected) {
+            log("CONDOR IDLE KEEPALIVE: GATT is no longer connected")
+            return
+        }
+
+        if (condorIdleKeepAlivePending) {
+            log("CONDOR IDLE KEEPALIVE: previous request still pending")
+            handler.postDelayed(
+                condorIdleKeepAliveRunnable,
+                condorIdleKeepAliveIntervalMs
+            )
+            return
+        }
+
+        val frame = CondorProtocol.getPropsReq("1", "Battery")
+        condorIdleKeepAlivePending = true
+        condorIdleKeepAliveCount++
+
+        val nowMs = SystemClock.elapsedRealtime()
+        val sinceLastResponseMs =
+            if (condorIdleKeepAliveLastResponseAtMs == 0L) {
+                -1L
+            } else {
+                nowMs - condorIdleKeepAliveLastResponseAtMs
+            }
+
+        log("")
+        log("=== CONDOR IDLE KEEPALIVE #$condorIdleKeepAliveCount ===")
+        log("Sending GetProps 1 / Battery")
+        log("reason: idle diagnostic test v2")
+        log(
+            "time since previous keepalive response=" +
+                "${if (sinceLastResponseMs >= 0) "$sinceLastResponseMs ms" else "unknown"}"
+        )
+        log("Frame HEX=${bytesToHex(frame)}")
+
+        sendCondorFrame(gatt, frame)
+
+        handler.postDelayed({
+            if (condorIdleKeepAlivePending) {
+                condorIdleKeepAlivePending = false
+                log("CONDOR IDLE KEEPALIVE TIMEOUT: no GenericResp within 5 seconds")
+
+                // Keep the diagnostic running even if one probe is lost.
+                // The important observation is whether the GATT link itself
+                // survives the repeated 5-second probes.
+                if (bluetoothGatt != null && isGattConnected) {
+                    handler.postDelayed(
+                        condorIdleKeepAliveRunnable,
+                        condorIdleKeepAliveIntervalMs
+                    )
+                }
+            }
+        }, 5_000L)
     }
 
     @SuppressLint("MissingPermission")
@@ -2655,6 +3623,18 @@ class MainActivity : AppCompatActivity() {
         log("")
         log("=== CONDOR LIVE SUBSCRIPTIONS ===")
         log("Using ${CondorProtocol.DEFAULT_SUBSCRIBE_PORTS.size} default live port subscriptions")
+        log("NOTE: subscription watchdog is passive; it sends NO BLE traffic")
+
+        condorLastActivityAtMs = SystemClock.elapsedRealtime()
+
+        if (!condorIdleWatchdogRunning) {
+            condorIdleWatchdogRunning = true
+            handler.postDelayed(
+                condorIdleWatchdogRunnable,
+                condorIdleWatchdogIntervalMs
+            )
+        }
+
         requestNextCondorSubscription(gatt)
     }
 
@@ -2667,7 +3647,11 @@ class MainActivity : AppCompatActivity() {
 
         if (condorSubscribeIndex >= CondorProtocol.DEFAULT_SUBSCRIBE_PORTS.size) {
             condorPendingRequest = CondorPendingRequest.NONE
-                log("=== CONDOR LIVE SUBSCRIPTIONS COMPLETE ===")
+            log("=== CONDOR LIVE SUBSCRIPTIONS COMPLETE ===")
+            log(
+                "All ${CondorProtocol.DEFAULT_SUBSCRIBE_PORTS.size} " +
+                    "logical subscriptions returned GenericResp status=0"
+            )
             log("Subscribed ports=${condorSubscribedPorts.size}")
             for ((product, port) in condorSubscribedPorts) {
                 log("  SUBSCRIBED $product / $port")
@@ -2703,7 +3687,10 @@ class MainActivity : AppCompatActivity() {
         log("Product ID: $productId")
         log("Port: $port")
         log("Timeout: ${CondorProtocol.SUBSCRIBE_TIMEOUT_SECS} seconds")
-        log("Body/frame HEX=${bytesToHex(frame)}")
+        // Byte-level comparison with the upstream Condor implementation:
+        // product_id + NUL + port + NUL + JSON timeout.
+        log("SUBSCRIBE PAYLOAD HEX=${bytesToHex(frame.copyOfRange(5, frame.size))}")
+        log("SUBSCRIBE FRAME HEX=${bytesToHex(frame)}")
         sendCondorFrame(gatt, frame)
     }
 
@@ -2957,6 +3944,81 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun initLogFile() {
+
+        try {
+            val timestamp =
+                SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
+                    .format(Date())
+
+            logFileDisplayName = "sonicare_${timestamp}.log"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, logFileDisplayName)
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(
+                        MediaStore.Downloads.RELATIVE_PATH,
+                        Environment.DIRECTORY_DOWNLOADS + "/SonicareBleDiagnostic"
+                    )
+                }
+
+                logFileUri = contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    values
+                )
+
+                val uri = logFileUri
+                if (uri != null) {
+                    val output = contentResolver.openOutputStream(uri, "wa")
+                    if (output != null) {
+                        logFileWriter = BufferedWriter(OutputStreamWriter(output, Charsets.UTF_8))
+                        return
+                    }
+                }
+
+                throw IllegalStateException("MediaStore log file could not be opened")
+            } else {
+                @Suppress("DEPRECATION")
+                val downloads = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                )
+                val directory = File(downloads, "SonicareBleDiagnostic")
+                if (!directory.exists() && !directory.mkdirs()) {
+                    throw IllegalStateException("Cannot create log directory: $directory")
+                }
+
+                val file = File(directory, logFileDisplayName)
+                logFileWriter = BufferedWriter(
+                    OutputStreamWriter(FileOutputStream(file, true), Charsets.UTF_8)
+                )
+            }
+
+        } catch (e: Exception) {
+            logFileDisplayName = ""
+            logFileUri = null
+            logFileWriter = null
+            // The diagnostic UI log continues to work even if file creation fails.
+            android.util.Log.e(TAG, "Cannot create diagnostic log file", e)
+        }
+    }
+
+    private fun writeLogLineToFile(line: String) {
+        logFileExecutor.execute {
+            try {
+                synchronized(this@MainActivity) {
+                    logFileWriter?.apply {
+                        write(line)
+                        newLine()
+                        flush()
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "Cannot write diagnostic log", e)
+            }
+        }
+    }
+
     private fun log(
         message: String
     ) {
@@ -2966,6 +4028,9 @@ class MainActivity : AppCompatActivity() {
 
         val line =
             "[$timestamp] $message"
+
+        // Queue file I/O so BLE callbacks are not blocked by storage writes.
+        writeLogLineToFile(line)
 
         runOnUiThread {
 
@@ -3018,7 +4083,31 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
 
+        condorIdleWatchdogRunning = false
+        handler.removeCallbacks(condorIdleWatchdogRunnable)
+        handler.removeCallbacks(condorIdleKeepAliveRunnable)
+        condorIdleKeepAlivePending = false
+        handler.removeCallbacks(autoScanRestartRunnable)
+
         stopScan()
+
+        // Finish all queued log writes before closing the activity.
+        logFileExecutor.execute {
+            try {
+                synchronized(this@MainActivity) {
+                    logFileWriter?.flush()
+                    logFileWriter?.close()
+                    logFileWriter = null
+                }
+            } catch (_: Exception) {
+            }
+        }
+        logFileExecutor.shutdown()
+        try {
+            logFileExecutor.awaitTermination(2, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
 
         try {
             bluetoothGatt?.close()
