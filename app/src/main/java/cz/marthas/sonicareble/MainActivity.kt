@@ -997,7 +997,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         if (device == null) {
             log("CONNECT: no selected device")
-            updateStatus("Nejdříve spusť Scan")            return
+            updateStatus("Nejdříve spusť Scan")
+            return
         }
 
         if (gattConnectInProgress) {
