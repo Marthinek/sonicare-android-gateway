@@ -11,8 +11,8 @@ android {
         applicationId = "cz.marthas.sonicareble"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.34"
     }
 
     compileOptions {
@@ -29,8 +29,16 @@ kotlin {
     jvmToolchain(17)
 }
 
+packaging {
+    resources {
+        excludes += "META-INF/INDEX.LIST"
+        excludes += "META-INF/io.netty.versions.properties"
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("com.google.android.material:material:1.13.0")
+    implementation("com.hivemq:hivemq-mqtt-client:1.3.10")
 }
