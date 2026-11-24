@@ -141,7 +141,8 @@ cd sonicare-android-gateway
 
 Build the debug APK:
 
-```./gradlew clean assembleDebug
+```bash
+./gradlew clean assembleDebug
 ```
 
 ## Release
@@ -153,6 +154,26 @@ Current stable release:
 Release tag:
 
 https://github.com/Marthinek/sonicare-android-gateway/releases/tag/v0.1.34
+
+## Credits and licensing
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file.
+
+The Condor protocol implementation in this gateway follows and adapts protocol definitions and handling from the community project [philips_sonicare_ble](https://github.com/mtheli/philips_sonicare_ble), maintained by **mtheli**. That project is also MIT-licensed. The upstream copyright and MIT permission notice are retained in this repository's [LICENSE](LICENSE).
+
+Thanks to mtheli for the protocol research and for making the Home Assistant integration open source.
+
+## Issues and support
+
+Please report issues related to the **Android gateway itself** in this repository:
+
+https://github.com/Marthinek/sonicare-android-gateway/issues
+
+This includes Android app problems, BLE scanning/connection, Condor communication on the phone, and MQTT publishing.
+
+For issues specific to the **Home Assistant integration**, its entities, or its Home Assistant-side protocol handling, please use the upstream integration repository:
+
+https://github.com/mtheli/philips_sonicare_ble/issues
 
 ## Disclaimer
 
