@@ -4605,20 +4605,19 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         stopScan()
 
-        if (!isChangingConfigurations) {
-            // Locking the screen does not destroy this Activity. A real exit
-            // shuts down the gateway; a configuration recreation leaves the
-            // service-owned GATT connection alive.
-            log("FOREGROUND SERVICE: stopping because MainActivity is being destroyed")
-            bleService?.shutdownGateway()
-            stopService(SonicareBleForegroundService.startIntent(this))
-            localBluetoothGatt = null
-            gattConnectInProgress = false
-        } else {
-            log("FOREGROUND SERVICE: keeping service/GATT during Activity recreation")
-            bleService?.setGattCallbackDelegate(null)
-            bleService?.setLogListener(null)
-        }
+        // The running BLE/protocol controller is currently bound to this
+        // Activity instance. If Android recreates the Activity (for example
+        // after rotation), stop this session rather than leaving callbacks
+        // pointed at a destroyed controller. Screen locking only calls
+        // onStop(), so it does not reach this block.
+        log(
+            "FOREGROUND SERVICE: stopping because MainActivity is being destroyed; " +
+                "changingConfigurations=$isChangingConfigurations"
+        )
+        bleService?.shutdownGateway()
+        stopService(SonicareBleForegroundService.startIntent(this))
+        localBluetoothGatt = null
+        gattConnectInProgress = false
 
         if (isBleServiceBound) {
             try {
