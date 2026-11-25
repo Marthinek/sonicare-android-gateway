@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
-        private const val APP_VERSION = "0.1.34"
+        private const val APP_VERSION = "0.1.35"
 
         private const val PERMISSION_REQUEST_CODE = 1001
 
@@ -110,6 +110,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusView: TextView
 
     private lateinit var mqttManager: MqttManager
+    private lateinit var addressDiagnostics: BluetoothAddressDiagnostics
 
     // Full diagnostic log is written continuously to the phone storage so
     // long brushing sessions are not lost because of clipboard size limits.
@@ -416,6 +417,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
             if (containsCondor ||
                 name?.contains("Sonicare", ignoreCase = true) == true
             ) {
+                addressDiagnostics.record(device, "SCAN", rssi)
+
                 if (selectedDevice == null) {
                     selectedDevice = device
 
@@ -496,6 +499,9 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         bluetoothAdapter = bluetoothManager.adapter
         bleScanner = bluetoothAdapter.bluetoothLeScanner
+        addressDiagnostics = BluetoothAddressDiagnostics(this, bluetoothAdapter) { message ->
+            log(message)
+        }
 
         requestBlePermissionsIfNeeded()
         initLogFile()
@@ -503,6 +509,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
             log("LOG FILE: Downloads/SonicareBleDiagnostic/$logFileDisplayName")
         } else {
             log("LOG FILE: unable to create diagnostic log file")
+        }
+
+        if (blePermissionsGranted()) {
+            addressDiagnostics.logBondedSonicareDevices("APP_START_BONDED_LIST")
         }
 
         if (autoConnectEnabled && blePermissionsGranted()) {
@@ -842,6 +852,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
             return
         }
 
+        addressDiagnostics.logBondedSonicareDevices("SCAN_START_BONDED_LIST")
         selectedDevice = null
 
         stopScan()
@@ -929,6 +940,13 @@ private var condorDiagLastTxNotificationAtMs = 0L
         }
 
         log("SCAN fallback: checking ${bondedDevices.size} bonded device(s)")
+        bondedDevices
+            .filter { device ->
+                val name = try { device.name } catch (_: SecurityException) { null }
+                name?.contains("Sonicare", ignoreCase = true) == true ||
+                    name?.contains("Philips", ignoreCase = true) == true
+            }
+            .forEach { addressDiagnostics.record(it, "BONDED_LIST") }
 
         val candidate = bondedDevices.firstOrNull { device ->
             val name = try {
@@ -1027,6 +1045,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
         log("")
         log("=== GATT CONNECT ===")
         log("Address: ${device.address}")
+        addressDiagnostics.record(device, "CONNECT_ATTEMPT")
         log("Connection generation=$generation")
 
         try {
@@ -1126,6 +1145,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     log(
                         "GATT CONNECTED id=${System.identityHashCode(gatt)}"
                     )
+                    addressDiagnostics.record(gatt.device, "GATT_CONNECTED")
 
                     // Start every GATT session with clean Condor state.
                     condorStage = 0
