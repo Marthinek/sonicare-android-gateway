@@ -39,6 +39,7 @@ import android.text.InputType
 import android.provider.MediaStore
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import cz.marthas.sonicareble.condor.CondorMqttGateway
 import cz.marthas.sonicareble.condor.CondorProtocol
 import java.text.SimpleDateFormat
 import java.io.BufferedWriter
@@ -269,6 +270,9 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var mqttManager: MqttManager
 
+    // MQTT contract of the philips_sonicare_ble Home Assistant integration.
+    private lateinit var mqttGateway: CondorMqttGateway
+
     // Full diagnostic log is written continuously to the phone storage so
     // long brushing sessions are not lost because of clipboard size limits.
     private val logFileExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -472,7 +476,10 @@ class MainActivity : AppCompatActivity() {
         GET_PRODUCTS,
         GET_PORTS,
         GET_PROPS,
-        SUBSCRIBE
+        SUBSCRIBE,
+        // A request from Home Assistant (MQTT <base>/cmd); its answer goes
+        // to mqttGateway.
+        GATEWAY_CMD
     }
 
     private var condorPendingRequest = CondorPendingRequest.NONE
@@ -653,17 +660,12 @@ private var condorDiagLastTxNotificationAtMs = 0L
         mqttManager = MqttManager(this) { message ->
             log(message)
         }
+        mqttGateway = createMqttGateway()
 
         val savedMqttConfig = mqttManager.loadConfig()
         if (savedMqttConfig.enabled && savedMqttConfig.host.isNotBlank()) {
             log("MQTT: enabled -> connecting to saved broker")
-            mqttManager.connect(savedMqttConfig) { connected, message ->
-                runOnUiThread {
-                    updateStatus(
-                        if (connected) "MQTT připojeno" else "MQTT: $message"
-                    )
-                }
-            }
+            connectMqtt(savedMqttConfig)
         }
 
         val bluetoothManager =
@@ -805,6 +807,103 @@ private var condorDiagLastTxNotificationAtMs = 0L
         setContentView(root)
     }
 
+    private fun createMqttGateway(): CondorMqttGateway {
+        val brush = object : CondorMqttGateway.Brush {
+            override fun isIdle(): Boolean =
+                bluetoothGatt != null &&
+                    isGattConnected &&
+                    condorPendingRequest == CondorPendingRequest.NONE &&
+                    !condorDiscoveryActive &&
+                    !condorIdleKeepAlivePending
+
+            override fun send(frame: ByteArray, description: String): Boolean {
+                val gatt = bluetoothGatt
+                if (gatt == null || !isGattConnected) return false
+                condorPendingRequest = CondorPendingRequest.GATEWAY_CMD
+                log("MQTT GATEWAY: $description")
+                sendCondorFrame(gatt, frame, description = description)
+                return true
+            }
+
+            override fun abandon() {
+                if (condorPendingRequest == CondorPendingRequest.GATEWAY_CMD) {
+                    condorPendingRequest = CondorPendingRequest.NONE
+                }
+            }
+        }
+
+        val timer = CondorMqttGateway.Timer { delayMs, action ->
+            val runnable = Runnable { action() }
+            handler.postDelayed(runnable, delayMs)
+            return@Timer { handler.removeCallbacks(runnable) }
+        }
+
+        // ind/*/SensorData.b comes several times per second; keep it out of
+        // the log.
+        val publisher = CondorMqttGateway.Publisher { topic, payload, qos, retain ->
+            if (mqttManager.isConnected()) {
+                mqttManager.publish(
+                    topic,
+                    payload,
+                    retained = retain,
+                    qos = qos,
+                    quiet = topic.endsWith(".b")
+                )
+            }
+        }
+
+        return CondorMqttGateway(
+            out = publisher,
+            brush = brush,
+            timer = timer,
+            gatewayName = "Sonicare BLE Gateway (Android)",
+            gatewayVersion = APP_VERSION,
+            log = { log(it) }
+        )
+    }
+
+    /** Connect to the broker, with the gateway's last will once the brush is known. */
+    private fun connectMqtt(config: MqttConfig) {
+        val willTopic = mqttGateway.willTopic
+        val session = willTopic?.let {
+            MqttSession(it, "offline") {
+                handler.post { mqttGateway.onMqttConnected() }
+            }
+        }
+        mqttManager.connect(config, session) { connected, message ->
+            runOnUiThread {
+                updateStatus(
+                    if (connected) "MQTT připojeno" else "MQTT: $message"
+                )
+            }
+        }
+        val base = mqttGateway.base
+        if (base != null) {
+            mqttManager.subscribe("$base/cmd") { _, payload ->
+                handler.post { mqttGateway.onCommand(payload) }
+            }
+        }
+    }
+
+    /** Gateway topics follow the brush address; a new brush needs a new last will. */
+    @SuppressLint("MissingPermission")
+    private fun attachMqttGateway(device: BluetoothDevice) {
+        val name = try {
+            device.name
+        } catch (_: SecurityException) {
+            null
+        }
+        val oldBase = mqttGateway.base
+        if (!mqttGateway.attach(device.address, name)) return
+        log("MQTT GATEWAY: topics ${mqttGateway.base}/...")
+        if (oldBase != null) mqttManager.unsubscribe("$oldBase/cmd")
+
+        val config = mqttManager.loadConfig()
+        if (config.enabled && config.host.isNotBlank()) {
+            connectMqtt(config)
+        }
+    }
+
     private fun showMqttSettingsDialog() {
         val config = mqttManager.loadConfig()
 
@@ -867,6 +966,14 @@ private var condorDiagLastTxNotificationAtMs = 0L
         tlsCheckBox.isChecked = config.tls
         container.addView(tlsCheckBox)
 
+        // The gateway topics (sonicare_gateway/<address>/...) are always
+        // published. The older topics under the base topic, with this app's
+        // own Home Assistant discovery, only on request.
+        val legacyCheckBox = CheckBox(this)
+        legacyCheckBox.text = "Own HA discovery + old topics (base topic)"
+        legacyCheckBox.isChecked = config.legacyDiscovery
+        container.addView(legacyCheckBox)
+
         val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle("MQTT nastavení")
             .setView(container)
@@ -905,20 +1012,15 @@ private var condorDiagLastTxNotificationAtMs = 0L
                         username = username,
                         password = password,
                         baseTopic = baseTopic,
-                        tls = tlsCheckBox.isChecked
+                        tls = tlsCheckBox.isChecked,
+                        legacyDiscovery = legacyCheckBox.isChecked
                     )
 
                     mqttManager.saveConfig(newConfig)
 
                     if (newConfig.enabled) {
                         updateStatus("Připojuji MQTT...")
-                        mqttManager.connect(newConfig) { connected, message ->
-                            runOnUiThread {
-                                updateStatus(
-                                    if (connected) "MQTT připojeno" else "MQTT: $message"
-                                )
-                            }
-                        }
+                        connectMqtt(newConfig)
                     } else {
                         mqttManager.disconnect()
                         updateStatus("MQTT vypnuto")
@@ -927,7 +1029,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     log(
                         "MQTT config saved: enabled=${newConfig.enabled}, " +
                             "broker=${newConfig.host}:${newConfig.port}, " +
-                            "baseTopic=${newConfig.baseTopic}, tls=${newConfig.tls}"
+                            "baseTopic=${newConfig.baseTopic}, tls=${newConfig.tls}, " +
+                            "legacyDiscovery=${newConfig.legacyDiscovery}"
                     )
 
                     dialog.dismiss()
@@ -1274,6 +1377,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
         gattConnectionGeneration++
         val generation = gattConnectionGeneration
 
+        attachMqttGateway(device)
+
         log("")
         log("=== GATT CONNECT ===")
         log("Address: ${device.address}")
@@ -1469,6 +1574,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     isGattConnected = false
                     gattConnectInProgress = false
                     condorDiscoveryActive = false
+                    if (condorPendingRequest == CondorPendingRequest.GATEWAY_CMD) {
+                        condorPendingRequest = CondorPendingRequest.NONE
+                    }
+                    mqttGateway.sessionDown()
                     condorIdleWatchdogRunning = false
                     handler.removeCallbacks(condorIdleWatchdogRunnable)
                     handler.removeCallbacks(condorIdleKeepAliveRunnable)
@@ -3653,6 +3762,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     "CONDOR InitializeResp received - " +
                         "framed transport is working"
                 )
+                mqttGateway.sessionUp()
 
                 updateStatus(
                     "Condor InitializeResp přijata"
@@ -3667,6 +3777,9 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 msgType == CondorProtocol.MSG_GENERIC_RESP
             ) {
                 handleCondorGenericResponse(body)
+                // A request of the app itself may have finished; queued Home
+                // Assistant requests can go now.
+                mqttGateway.pump()
             }
         }
     }
@@ -3696,6 +3809,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 urgent = true,
                 description = "CHANGE_IND_RESP"
             )
+            mqttGateway.changeIndication(body)
         } else {
             log("CONDOR ChangeIndication ACK skipped: GATT disconnected")
         }
@@ -3704,6 +3818,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
     private fun handleCondorGenericResponse(body: ByteArray) {
         if (body.isEmpty()) {
             log("CONDOR GenericResp body is empty")
+            if (condorPendingRequest == CondorPendingRequest.GATEWAY_CMD) {
+                condorPendingRequest = CondorPendingRequest.NONE
+                mqttGateway.onResponse(CondorMqttGateway.STATUS_NO_STATUS, null)
+            }
             return
         }
 
@@ -3721,6 +3839,12 @@ private var condorDiagLastTxNotificationAtMs = 0L
         condorDiagLastGenericRespSummary = "status=$status; json=${jsonText.take(120)}"
         log("CONDOR GenericResp status=$status")
         log("CONDOR GenericResp JSON=$jsonText")
+
+        if (condorPendingRequest == CondorPendingRequest.GATEWAY_CMD) {
+            condorPendingRequest = CondorPendingRequest.NONE
+            mqttGateway.onResponse(status, jsonText)
+            return
+        }
 
         // Publish every successful non-empty Condor JSON response to MQTT.
         // Do not use condorPendingRequest here: that state describes our
@@ -3796,6 +3920,13 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     condorPendingRequest = CondorPendingRequest.NONE
                     condorDiscoveryActive = false
                     updateStatus("Condor discovery selhala")
+                    // Nothing was read; report an empty snapshot so that
+                    // requests from Home Assistant are not blocked.
+                    mqttGateway.snapshotComplete()
+                }
+
+                CondorPendingRequest.GATEWAY_CMD -> {
+                    // Handled above.
                 }
 
                 CondorPendingRequest.SUBSCRIBE -> {
@@ -3847,6 +3978,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 // Keep a compact copy for the final discovery summary.
                 condorDiscoveredProps +=
                     "$productId / $port -> $jsonText"
+                mqttGateway.portRead(productId, port, jsonText)
 
                 // Also print individual JSON properties. This makes it much
                 // easier to spot battery/session/statistics fields in the log.
@@ -3877,6 +4009,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 }
             }
 
+            CondorPendingRequest.GATEWAY_CMD -> {
+                // Handled above.
+            }
+
             CondorPendingRequest.NONE -> {
                 log("CONDOR GenericResp received without pending request")
             }
@@ -3884,7 +4020,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
     }
 
     private fun publishCondorTelemetryToMqtt(jsonText: String) {
-        if (!mqttManager.loadConfig().enabled || jsonText.isBlank()) {
+        val config = mqttManager.loadConfig()
+        if (!config.enabled || !config.legacyDiscovery || jsonText.isBlank()) {
             return
         }
 
@@ -3951,6 +4088,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 log("CONDOR: no product IDs returned")
                 condorPendingRequest = CondorPendingRequest.NONE
                 condorDiscoveryActive = false
+                mqttGateway.snapshotComplete()
                 return
             }
 
@@ -3975,6 +4113,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
             log("CONDOR GetProducts JSON parse failed: ${e.message}")
             condorPendingRequest = CondorPendingRequest.NONE
             condorDiscoveryActive = false
+            mqttGateway.snapshotComplete()
         }
     }
 
@@ -3997,6 +4136,11 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     "COUNT=${condorPorts.size}: " +
                     condorPorts.joinToString()
             )
+
+            // Binary ports (*.b) are streams; they can only be subscribed.
+            if (condorPorts.removeAll { it.endsWith(".b") }) {
+                log("CONDOR PORTS: binary *.b ports are not read")
+            }
 
             if (condorPorts.isEmpty()) {
                 log("CONDOR: no ports returned for $condorCurrentProductId")
@@ -4064,6 +4208,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         condorPendingRequest = CondorPendingRequest.NONE
         condorDiscoveryActive = false
+
+        mqttGateway.snapshotComplete()
 
         log("")
         log("=== CONDOR PRODUCT/PORT DISCOVERY COMPLETE ===")
