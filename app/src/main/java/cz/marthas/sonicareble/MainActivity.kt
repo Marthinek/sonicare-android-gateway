@@ -4428,6 +4428,9 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
     override fun onDestroy() {
         log("ACTIVITY LIFECYCLE: onDestroy")
+        handler.removeCallbacks(uiLogFlushRunnable)
+        pendingUiLogLines.clear()
+        uiLogFlushScheduled.set(false)
 
         condorIdleWatchdogRunning = false
         handler.removeCallbacks(condorIdleWatchdogRunnable)
