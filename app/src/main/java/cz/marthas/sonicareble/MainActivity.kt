@@ -60,7 +60,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
-        private const val APP_VERSION = "0.1.35-queuefix3"
+        private const val APP_VERSION = "0.1.35-queuefix4"
 
         private const val PERMISSION_REQUEST_CODE = 1001
         private const val UI_LOG_FLUSH_INTERVAL_MS = 100L
@@ -4579,7 +4579,33 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         stopScan()
 
-        // Finish all queued log writes before closing the activity.
+        if (!isChangingConfigurations) {
+            // Locking the screen does not destroy this Activity. A real exit
+            // shuts down the gateway; a configuration recreation leaves the
+            // service-owned GATT connection alive.
+            log("FOREGROUND SERVICE: stopping because MainActivity is being destroyed")
+            bleService?.shutdownGateway()
+            stopService(SonicareBleForegroundService.startIntent(this))
+            localBluetoothGatt = null
+            gattConnectInProgress = false
+        } else {
+            log("FOREGROUND SERVICE: keeping service/GATT during Activity recreation")
+            bleService?.setGattCallbackDelegate(null)
+            bleService?.setLogListener(null)
+        }
+
+        if (isBleServiceBound) {
+            try {
+                unbindService(bleServiceConnection)
+            } catch (_: Exception) {
+            }
+            isBleServiceBound = false
+            bleService = null
+        }
+        isBleServiceBinding = false
+
+        // Service shutdown happens before the file writer is closed so its
+        // final lifecycle/GATT messages are included in this session's log.
         logFileExecutor.execute {
             try {
                 synchronized(this@MainActivity) {
@@ -4597,37 +4623,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
             Thread.currentThread().interrupt()
         }
 
-        if (!isChangingConfigurations) {
-            // A real Activity shutdown also ends the user-started gateway.
-            // Screen locking does not call onDestroy(), so the service and GATT
-            // remain untouched while the app is merely in the background.
-            log("FOREGROUND SERVICE: stopping because MainActivity is being destroyed")
-            bleService?.shutdownGateway()
-            stopService(SonicareBleForegroundService.startIntent(this))
-        } else {
-            // During an Activity recreation the Service and GATT must survive.
-            bleService?.setGattCallbackDelegate(null)
-            bleService?.setLogListener(null)
-        }
-
-        bluetoothGatt = null
-        gattConnectInProgress = false
-
-        if (isBleServiceBound) {
-            try {
-                unbindService(bleServiceConnection)
-            } catch (_: Exception) {
-            }
-            isBleServiceBound = false
-            bleService = null
-        }
-
-
         try {
             mqttManager.disconnect()
         } catch (_: Exception) {
         }
 
         super.onDestroy()
-    }
-}
+    }}
