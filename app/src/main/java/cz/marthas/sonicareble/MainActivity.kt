@@ -2506,274 +2506,274 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         condorGattWritePumpRunning = true
         try {
-        if (bluetoothGatt != gatt || !isGattConnected) {
-            log("CONDOR GATT WRITE: pump aborted, GATT disconnected")
-            return
-        }
+            if (bluetoothGatt != gatt || !isGattConnected) {
+                log("CONDOR GATT WRITE: pump aborted, GATT disconnected")
+                return
+            }
 
-        if (
-            condorGattWriteInFlight != null ||
-            condorGattWriteRetryScheduled
-        ) {
-            return
-        }
+            if (
+                condorGattWriteInFlight != null ||
+                condorGattWriteRetryScheduled
+            ) {
+                return
+            }
 
-        val op = condorGattWriteQueue.peekFirst() ?: return
+            val op = condorGattWriteQueue.peekFirst() ?: return
 
-        val service = gatt.getService(CONDOR_SERVICE_UUID)
-        val characteristic =
-            service?.getCharacteristic(op.characteristicUuid)
+            val service = gatt.getService(CONDOR_SERVICE_UUID)
+            val characteristic =
+                service?.getCharacteristic(op.characteristicUuid)
 
-        if (characteristic == null) {
+            if (characteristic == null) {
+                log(
+                    "CONDOR GATT WRITE: characteristic not found: " +
+                        op.characteristicUuid
+                )
+                condorGattWriteQueue.removeFirst()
+                handleCondorGattWriteFailure(gatt, op, -1)
+                return
+            }
+
             log(
-                "CONDOR GATT WRITE: characteristic not found: " +
-                    op.characteristicUuid
+                "CONDOR GATT WRITE START: ${op.description}; " +
+                    "queue=${condorGattWriteQueue.size}; " +
+                    "HEX=${bytesToHex(op.value)}"
             )
-            condorGattWriteQueue.removeFirst()
-            handleCondorGattWriteFailure(gatt, op, -1)
-            return
-        }
+            recordCondorGattHistory(
+                "WRITE_START ${op.description} queue=${condorGattWriteQueue.size}"
+            )
 
-        log(
-            "CONDOR GATT WRITE START: ${op.description}; " +
-                "queue=${condorGattWriteQueue.size}; " +
-                "HEX=${bytesToHex(op.value)}"
-        )
-        recordCondorGattHistory(
-            "WRITE_START ${op.description} queue=${condorGattWriteQueue.size}"
-        )
+            try {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    val result =
+                        gatt.writeCharacteristic(
+                            characteristic,
+                            op.value,
+                            BluetoothGattCharacteristic
+                                .WRITE_TYPE_NO_RESPONSE
+                        )
 
-        try {
-            if (Build.VERSION.SDK_INT >= 33) {
-                val result =
-                    gatt.writeCharacteristic(
-                        characteristic,
-                        op.value,
-                        BluetoothGattCharacteristic
-                            .WRITE_TYPE_NO_RESPONSE
+                    log(
+                        "CONDOR GATT WRITE immediateResult=$result " +
+                            "op=${op.kind}"
+                    )
+                    recordCondorGattHistory(
+                        "WRITE_RESULT result=$result ${op.description}"
                     )
 
-                log(
-                    "CONDOR GATT WRITE immediateResult=$result " +
-                        "op=${op.kind}"
-                )
-                recordCondorGattHistory(
-                    "WRITE_RESULT result=$result ${op.description}"
-                )
+                    when (result) {
+                        BluetoothGatt.GATT_SUCCESS -> {
+                            /*
+                             * WRITE_NO_RESPONSE is different from a normal
+                             * acknowledged GATT write: Android already returned
+                             * GATT_SUCCESS, meaning the invocation was accepted.
+                             *
+                             * On the Pixel + HX741X, onCharacteristicWrite() can
+                             * arrive immediately afterwards, but it is not
+                             * reliable enough to use as the completion signal for
+                             * this WRITE_NO_RESPONSE operation. Waiting for it can
+                             * leave the Condor queue stuck for 5 seconds even though
+                             * the brush already accepted the packet.
+                             *
+                             * Therefore GATT_SUCCESS completes this local queue
+                             * operation immediately. The 201 path remains strict:
+                             * 201 means the invocation was NOT accepted, so the
+                             * exact same packet stays at the queue head and is
+                             * retried.
+                             */
+                            condorGattWriteQueue.removeFirst()
 
-                when (result) {
-                    BluetoothGatt.GATT_SUCCESS -> {
-                        /*
-                         * WRITE_NO_RESPONSE is different from a normal
-                         * acknowledged GATT write: Android already returned
-                         * GATT_SUCCESS, meaning the invocation was accepted.
-                         *
-                         * On the Pixel + HX741X, onCharacteristicWrite() can
-                         * arrive immediately afterwards, but it is not
-                         * reliable enough to use as the completion signal for
-                         * this WRITE_NO_RESPONSE operation. Waiting for it can
-                         * leave the Condor queue stuck for 5 seconds even though
-                         * the brush already accepted the packet.
-                         *
-                         * Therefore GATT_SUCCESS completes this local queue
-                         * operation immediately. The 201 path remains strict:
-                         * 201 means the invocation was NOT accepted, so the
-                         * exact same packet stays at the queue head and is
-                         * retried.
-                         */
-                        condorGattWriteQueue.removeFirst()
+                            if (op.kind == CondorGattWriteKind.RX_FRAME) {
+                                condorTxWriteInFlight = false
 
-                        if (op.kind == CondorGattWriteKind.RX_FRAME) {
-                            condorTxWriteInFlight = false
+                                condorNextTxSeq =
+                                    (condorNextTxSeq + 1) and CondorProtocol.SEQ_MASK
 
-                            condorNextTxSeq =
-                                (condorNextTxSeq + 1) and CondorProtocol.SEQ_MASK
+                                condorTxActiveOffset = op.frameEndOffset
 
-                            condorTxActiveOffset = op.frameEndOffset
+                                if (
+                                    condorTxActiveFrame != null &&
+                                    condorTxActiveOffset >=
+                                        condorTxActiveFrame!!.size
+                                ) {
+                                    log(
+                                        "CONDOR TX: complete frame accepted by GATT"
+                                    )
+                                    condorTxActiveFrame = null
+                                    condorTxActiveOffset = 0
+                                }
+                            }
+
+                            condorDiagLastSuccessfulGattWriteAtMs =
+                                SystemClock.elapsedRealtime()
+                            condorDiagLastSuccessfulGattWriteDescription =
+                                op.description
+                            recordCondorGattHistory(
+                                "WRITE_ACCEPTED ${op.description} " +
+                                    "queue=${condorGattWriteQueue.size}"
+                            )
+
+                            log(
+                                "CONDOR GATT WRITE ACCEPTED: " +
+                                    "${op.description}; WRITE_NO_RESPONSE " +
+                                    "completed from immediateResult=0; " +
+                                    "activeOffset=$condorTxActiveOffset; " +
+                                    "activeFrameSize=${condorTxActiveFrame?.size ?: 0}; " +
+                                    "queue=${condorGattWriteQueue.size}"
+                            )
+
+                            /*
+                             * Do not immediately issue another BLE write after
+                             * WRITE_NO_RESPONSE returned 0. The invocation was
+                             * accepted, but the Pixel/Android ATT pipeline can
+                             * still need a short moment before the next write.
+                             *
+                             * RX_FRAME continuation is intentionally paced at 100 ms in
+                             * v0.1.30, while TX_ACK operations bypass that pacing.
+                             *
+                             * A late onCharacteristicWrite() callback may still
+                             * arrive. It must not consume the next queued operation.
+                             */
+                            /*
+                             * TX_ACK is time-critical. Do not put an ACK behind
+                             * the 100 ms RX_FRAME pacing experiment.
+                             *
+                             * RX_FRAME writes remain deliberately paced to avoid
+                             * Android GATT_BUSY (201), while a queued TX_ACK is
+                             * dispatched as soon as the current write has been
+                             * accepted. This mirrors the upstream Condor rule
+                             * that every incoming TX packet must be ACKed promptly.
+                             */
+                            val nextOp = condorGattWriteQueue.peekFirst()
 
                             if (
-                                condorTxActiveFrame != null &&
-                                condorTxActiveOffset >=
-                                    condorTxActiveFrame!!.size
+                                nextOp?.kind == CondorGattWriteKind.TX_ACK &&
+                                bluetoothGatt == gatt &&
+                                isGattConnected
                             ) {
                                 log(
-                                    "CONDOR TX: complete frame accepted by GATT"
+                                    "CONDOR GATT WRITE: TX_ACK bypasses " +
+                                        "${condorGattWritePacingDelayMs} ms pacing"
                                 )
-                                condorTxActiveFrame = null
-                                condorTxActiveOffset = 0
+                                pumpCondorGattWriteQueue(gatt)
+                            } else if (
+                                !condorGattWritePacingScheduled &&
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                condorGattWritePacingScheduled = true
+                                handler.postDelayed(
+                                    condorGattWritePacingRunnable,
+                                    condorGattWritePacingDelayMs
+                                )
+                                log(
+                                    "CONDOR GATT WRITE: RX_FRAME next operation " +
+                                        "paced by ${condorGattWritePacingDelayMs} ms"
+                                )
                             }
                         }
 
-                        condorDiagLastSuccessfulGattWriteAtMs =
-                            SystemClock.elapsedRealtime()
-                        condorDiagLastSuccessfulGattWriteDescription =
-                            op.description
-                        recordCondorGattHistory(
-                            "WRITE_ACCEPTED ${op.description} " +
-                                "queue=${condorGattWriteQueue.size}"
-                        )
+                        BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> {
+                            // 201 is NOT an accepted write. Keep the exact packet
+                            // at queue head; do not advance Condor state and do not
+                            // wait for a callback belonging to another write.
+                            op.retryCount++
+                            condorGattWriteBusyCount++
+                    condorDiagGattBusyTotal++
+                    condorDiagLastGattBusyAtMs = SystemClock.elapsedRealtime()
+                    condorDiagLastGattBusyDescription = op.description
 
-                        log(
-                            "CONDOR GATT WRITE ACCEPTED: " +
-                                "${op.description}; WRITE_NO_RESPONSE " +
-                                "completed from immediateResult=0; " +
-                                "activeOffset=$condorTxActiveOffset; " +
-                                "activeFrameSize=${condorTxActiveFrame?.size ?: 0}; " +
-                                "queue=${condorGattWriteQueue.size}"
-                        )
+                            recordCondorGattHistory(
+                                "WRITE_BUSY_201 ${op.description} retry=${op.retryCount}"
+                            )
 
-                        /*
-                         * Do not immediately issue another BLE write after
-                         * WRITE_NO_RESPONSE returned 0. The invocation was
-                         * accepted, but the Pixel/Android ATT pipeline can
-                         * still need a short moment before the next write.
-                         *
-                         * RX_FRAME continuation is intentionally paced at 100 ms in
-                         * v0.1.30, while TX_ACK operations bypass that pacing.
-                         *
-                         * A late onCharacteristicWrite() callback may still
-                         * arrive. It must not consume the next queued operation.
-                         */
-                        /*
-                         * TX_ACK is time-critical. Do not put an ACK behind
-                         * the 100 ms RX_FRAME pacing experiment.
-                         *
-                         * RX_FRAME writes remain deliberately paced to avoid
-                         * Android GATT_BUSY (201), while a queued TX_ACK is
-                         * dispatched as soon as the current write has been
-                         * accepted. This mirrors the upstream Condor rule
-                         * that every incoming TX packet must be ACKed promptly.
-                         */
-                        val nextOp = condorGattWriteQueue.peekFirst()
-
-                        if (
-                            nextOp?.kind == CondorGattWriteKind.TX_ACK &&
-                            bluetoothGatt == gatt &&
-                            isGattConnected
-                        ) {
                             log(
-                                "CONDOR GATT WRITE: TX_ACK bypasses " +
-                                    "${condorGattWritePacingDelayMs} ms pacing"
+                                "CONDOR GATT WRITE BUSY (201): " +
+                                    "totalBusy=$condorGattWriteBusyCount; " +
+                                    "${op.description}; " +
+                                    "retry ${op.retryCount}/$condorGattWriteMaxBusyRetries"
                             )
-                            pumpCondorGattWriteQueue(gatt)
-                        } else if (
-                            !condorGattWritePacingScheduled &&
-                            bluetoothGatt == gatt &&
-                            isGattConnected
-                        ) {
-                            condorGattWritePacingScheduled = true
-                            handler.postDelayed(
-                                condorGattWritePacingRunnable,
-                                condorGattWritePacingDelayMs
-                            )
-                            log(
-                                "CONDOR GATT WRITE: RX_FRAME next operation " +
-                                    "paced by ${condorGattWritePacingDelayMs} ms"
-                            )
+
+                            if (
+                                op.retryCount > condorGattWriteMaxBusyRetries
+                            ) {
+                                condorGattWriteQueue.removeFirst()
+                                handleCondorGattWriteFailure(
+                                    gatt,
+                                    op,
+                                    BluetoothStatusCodes
+                                        .ERROR_GATT_WRITE_REQUEST_BUSY
+                                )
+                            } else {
+                                condorGattWriteRetryScheduled = true
+                                handler.postDelayed({
+                                    condorGattWriteRetryScheduled = false
+                                    if (
+                                        bluetoothGatt == gatt &&
+                                        isGattConnected
+                                    ) {
+                                        pumpCondorGattWriteQueue(gatt)
+                                    }
+                                }, condorGattWriteRetryDelayMs)
+                            }
                         }
-                    }
 
-                    BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> {
-                        // 201 is NOT an accepted write. Keep the exact packet
-                        // at queue head; do not advance Condor state and do not
-                        // wait for a callback belonging to another write.
-                        op.retryCount++
-                        condorGattWriteBusyCount++
-                condorDiagGattBusyTotal++
-                condorDiagLastGattBusyAtMs = SystemClock.elapsedRealtime()
-                condorDiagLastGattBusyDescription = op.description
-
-                        recordCondorGattHistory(
-                            "WRITE_BUSY_201 ${op.description} retry=${op.retryCount}"
-                        )
-
-                        log(
-                            "CONDOR GATT WRITE BUSY (201): " +
-                                "totalBusy=$condorGattWriteBusyCount; " +
-                                "${op.description}; " +
-                                "retry ${op.retryCount}/$condorGattWriteMaxBusyRetries"
-                        )
-
-                        if (
-                            op.retryCount > condorGattWriteMaxBusyRetries
-                        ) {
+                        else -> {
                             condorGattWriteQueue.removeFirst()
                             handleCondorGattWriteFailure(
                                 gatt,
                                 op,
-                                BluetoothStatusCodes
-                                    .ERROR_GATT_WRITE_REQUEST_BUSY
+                                result
                             )
-                        } else {
-                            condorGattWriteRetryScheduled = true
-                            handler.postDelayed({
-                                condorGattWriteRetryScheduled = false
-                                if (
-                                    bluetoothGatt == gatt &&
-                                    isGattConnected
-                                ) {
-                                    pumpCondorGattWriteQueue(gatt)
-                                }
-                            }, condorGattWriteRetryDelayMs)
                         }
                     }
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = op.value
+                    characteristic.writeType =
+                        BluetoothGattCharacteristic
+                            .WRITE_TYPE_NO_RESPONSE
 
-                    else -> {
+                    @Suppress("DEPRECATION")
+                    val accepted =
+                        gatt.writeCharacteristic(characteristic)
+
+                    log(
+                        "CONDOR GATT WRITE legacy returned=$accepted " +
+                            "op=${op.kind}"
+                    )
+
+                    if (accepted) {
+                        condorGattWriteQueue.removeFirst()
+                        condorGattWriteInFlight = op
+                        condorTxWriteInFlight =
+                            op.kind == CondorGattWriteKind.RX_FRAME
+
+                        handler.removeCallbacks(
+                            condorTxWriteTimeoutRunnable
+                        )
+                        handler.postDelayed(
+                            condorTxWriteTimeoutRunnable,
+                            condorTxWriteTimeoutMs
+                        )
+                    } else {
                         condorGattWriteQueue.removeFirst()
                         handleCondorGattWriteFailure(
                             gatt,
                             op,
-                            result
+                            -1
                         )
                     }
                 }
-            } else {
-                @Suppress("DEPRECATION")
-                characteristic.value = op.value
-                characteristic.writeType =
-                    BluetoothGattCharacteristic
-                        .WRITE_TYPE_NO_RESPONSE
-
-                @Suppress("DEPRECATION")
-                val accepted =
-                    gatt.writeCharacteristic(characteristic)
-
+            } catch (e: Exception) {
                 log(
-                    "CONDOR GATT WRITE legacy returned=$accepted " +
-                        "op=${op.kind}"
+                    "CONDOR GATT WRITE EXCEPTION: " +
+                        "${e.javaClass.simpleName}: ${e.message}; " +
+                        "op=${op.description}"
                 )
-
-                if (accepted) {
-                    condorGattWriteQueue.removeFirst()
-                    condorGattWriteInFlight = op
-                    condorTxWriteInFlight =
-                        op.kind == CondorGattWriteKind.RX_FRAME
-
-                    handler.removeCallbacks(
-                        condorTxWriteTimeoutRunnable
-                    )
-                    handler.postDelayed(
-                        condorTxWriteTimeoutRunnable,
-                        condorTxWriteTimeoutMs
-                    )
-                } else {
-                    condorGattWriteQueue.removeFirst()
-                    handleCondorGattWriteFailure(
-                        gatt,
-                        op,
-                        -1
-                    )
-                }
+                condorGattWriteQueue.removeFirst()
+                handleCondorGattWriteFailure(gatt, op, -1)
             }
-        } catch (e: Exception) {
-            log(
-                "CONDOR GATT WRITE EXCEPTION: " +
-                    "${e.javaClass.simpleName}: ${e.message}; " +
-                    "op=${op.description}"
-            )
-            condorGattWriteQueue.removeFirst()
-            handleCondorGattWriteFailure(gatt, op, -1)
-        }
         } finally {
             condorGattWritePumpRunning = false
 
