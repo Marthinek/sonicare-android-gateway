@@ -145,11 +145,28 @@ class MainActivity : AppCompatActivity() {
                 }
             )
 
-            if (autoConnectEnabled && blePermissionsGranted() &&
-                !isGattConnected && !gattConnectInProgress && !isScanning
-            ) {
-                log("AUTO: foreground service bound -> starting BLE scan")
-                startScan()
+            // Wait briefly for onStartCommand() to finish startForeground().
+            // Do not open a BLE connection from a merely bound (background-
+            // unprotected) service if Android rejected foreground promotion.
+            if (autoConnectEnabled && blePermissionsGranted()) {
+                handler.postDelayed({
+                    if (bleService !== service) return@postDelayed
+
+                    if (!service.isForegroundActive()) {
+                        val startError = service.getForegroundStartError()
+                        log(
+                            "AUTO: BLE scan blocked because foreground service " +
+                                "is not active; error=${startError ?: "not reported"}"
+                        )
+                        updateStatus("BLE foreground služba není aktivní")
+                        return@postDelayed
+                    }
+
+                    if (!isGattConnected && !gattConnectInProgress && !isScanning) {
+                        log("AUTO: foreground service active and bound -> starting BLE scan")
+                        startScan()
+                    }
+                }, 300L)
             }
         }
 
