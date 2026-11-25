@@ -17,6 +17,7 @@ import android.bluetooth.le.ScanSettings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.os.Build
@@ -34,6 +35,7 @@ import android.widget.TextView
 import android.text.InputType
 import android.provider.MediaStore
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import cz.marthas.sonicareble.condor.CondorProtocol
 import java.text.SimpleDateFormat
 import java.io.BufferedWriter
@@ -55,7 +57,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
-        private const val APP_VERSION = "0.1.35-queuefix2"
+        private const val APP_VERSION = "0.1.35-queuefix3"
 
         private const val PERMISSION_REQUEST_CODE = 1001
         private const val UI_LOG_FLUSH_INTERVAL_MS = 100L
@@ -565,7 +567,14 @@ private var condorDiagLastTxNotificationAtMs = 0L
             log("LOG FILE: unable to create diagnostic log file")
         }
 
+        log("=== SONICARE BLE DIAGNOSTIC v$APP_VERSION ===")
+        log("Scanner version=$APP_VERSION")
+        log("Android SDK=${Build.VERSION.SDK_INT}")
+        log("Device=${Build.MODEL}")
+        log("Manufacturer=${Build.MANUFACTURER}")
+
         if (autoConnectEnabled && blePermissionsGranted()) {
+            startBleForegroundServiceIfReady()
             log("AUTO: enabled -> starting BLE scan")
             handler.post {
                 if (!isGattConnected && !gattConnectInProgress && !isScanning) {
@@ -573,14 +582,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 }
             }
         } else if (autoConnectEnabled) {
-            log("AUTO: waiting for BLE permissions")
+            log("AUTO: waiting for BLE permissions before foreground service and scan")
         }
-
-        log("=== SONICARE BLE DIAGNOSTIC v$APP_VERSION ===")
-        log("Scanner version=$APP_VERSION")
-        log("Android SDK=${Build.VERSION.SDK_INT}")
-        log("Device=${Build.MODEL}")
-        log("Manufacturer=${Build.MANUFACTURER}")
     }
 
     private fun createUi() {
@@ -836,14 +839,53 @@ private var condorDiagLastTxNotificationAtMs = 0L
         }
     }
 
+    private fun startBleForegroundServiceIfReady() {
+        if (!blePermissionsGranted()) {
+            log("FOREGROUND SERVICE: waiting for Bluetooth permissions")
+            return
+        }
+
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
+            log(
+                "FOREGROUND SERVICE: POST_NOTIFICATIONS not granted; " +
+                    "gateway will still run, but Android may hide its drawer notification"
+            )
+        }
+
+        try {
+            ContextCompat.startForegroundService(
+                this,
+                SonicareBleForegroundService.startIntent(this)
+            )
+            log(
+                "FOREGROUND SERVICE: connectedDevice start requested " +
+                    "(Activity is visible)"
+            )
+        } catch (e: Exception) {
+            log(
+                "FOREGROUND SERVICE START FAILED: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+            updateStatus("Nepodařilo se spustit BLE foreground service")
+        }
+    }
+
     private fun requestBlePermissionsIfNeeded() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
 
-            val permissions = arrayOf(
+            val permissions = mutableListOf(
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT
             )
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
 
             val missing = permissions.filter {
                 checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
@@ -882,6 +924,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
         if (requestCode == PERMISSION_REQUEST_CODE) {
             if (blePermissionsGranted()) {
                 log("BLE permissions granted")
+                startBleForegroundServiceIfReady()
                 if (autoConnectEnabled && !isGattConnected && !gattConnectInProgress && !isScanning) {
                     log("AUTO: permissions ready -> starting BLE scan")
                     startScan()
