@@ -1269,7 +1269,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 ?: throw IllegalStateException("Foreground BLE service is not bound")
 
             service.setGattCallbackDelegate(gattCallback)
-            val newGatt = service.connectGatt(device, handler)
+            val newGatt = service.connectGatt(device)
                 ?: throw IllegalStateException("Service returned no BluetoothGatt")
 
             bluetoothGatt = newGatt
