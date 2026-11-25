@@ -21,6 +21,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -50,6 +51,7 @@ class SonicareBleForegroundService : Service() {
     }
 
     private val binder = LocalBinder()
+    private val bleCallbackHandler = Handler(Looper.getMainLooper())
     private var foregroundActive = false
     private var foregroundStartError: String? = null
     private var bluetoothLeScanner: BluetoothLeScanner? = null
@@ -186,10 +188,7 @@ class SonicareBleForegroundService : Service() {
     }
 
     @Suppress("MissingPermission")
-    fun connectGatt(
-        device: BluetoothDevice,
-        callbackHandler: Handler
-    ): BluetoothGatt? {
+    fun connectGatt(device: BluetoothDevice): BluetoothGatt? {
         if (bluetoothGatt != null) {
             serviceLog("GATT connect ignored: an existing GATT object is still stored")
             return bluetoothGatt
@@ -267,7 +266,7 @@ class SonicareBleForegroundService : Service() {
                 proxy,
                 BluetoothDevice.TRANSPORT_LE,
                 BluetoothDevice.PHY_LE_1M_MASK,
-                callbackHandler
+                bleCallbackHandler
             )
             bluetoothGatt = gatt
             serviceLog(
