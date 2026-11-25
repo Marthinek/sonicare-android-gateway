@@ -18,6 +18,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.os.Build
@@ -98,8 +101,78 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var bluetoothAdapter: BluetoothAdapter
-    private var bleScanner: BluetoothLeScanner? = null
-    private var bluetoothGatt: BluetoothGatt? = null
+
+    private var bleService: SonicareBleForegroundService? = null
+    private var isBleServiceBound = false
+    private var isBleServiceBinding = false
+    private var localBluetoothGatt: BluetoothGatt? = null
+
+    // Keep existing protocol code source-compatible while the actual GATT
+    // object is owned by SonicareBleForegroundService.
+    private var bluetoothGatt: BluetoothGatt?
+        get() = bleService?.getBluetoothGatt() ?: localBluetoothGatt
+        set(value) {
+            localBluetoothGatt = value
+            bleService?.setBluetoothGatt(value)
+        }
+
+    private val bleServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val localBinder = binder as? SonicareBleForegroundService.LocalBinder
+            val service = localBinder?.getService()
+            if (service == null) {
+                log("FOREGROUND SERVICE: invalid binder received")
+                isBleServiceBinding = false
+                return
+            }
+
+            bleService = service
+            isBleServiceBound = true
+            isBleServiceBinding = false
+            service.setGattCallbackDelegate(gattCallback)
+            service.setLogListener { message ->
+                handler.post {
+                    log("BLE SERVICE: $message")
+                }
+            }
+
+            val error = service.getForegroundStartError()
+            log(
+                if (service.isForegroundActive()) {
+                    "FOREGROUND SERVICE: BOUND and ACTIVE (connectedDevice)"
+                } else {
+                    "FOREGROUND SERVICE: BOUND but not active; error=${error ?: "unknown"}"
+                }
+            )
+
+            if (autoConnectEnabled && blePermissionsGranted() &&
+                !isGattConnected && !gattConnectInProgress && !isScanning
+            ) {
+                log("AUTO: foreground service bound -> starting BLE scan")
+                startScan()
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            log("FOREGROUND SERVICE: disconnected from service binder")
+            bleService = null
+            isBleServiceBound = false
+            isBleServiceBinding = false
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            log("FOREGROUND SERVICE: service binding died")
+            bleService = null
+            isBleServiceBound = false
+            isBleServiceBinding = false
+        }
+
+        override fun onNullBinding(name: ComponentName?) {
+            log("FOREGROUND SERVICE: service returned a null binding")
+            isBleServiceBinding = false
+        }
+    }
+
     private var isGattConnected = false
 
     // Connection guard: prevents a second connectGatt() while the first
@@ -557,7 +630,6 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     as BluetoothManager
 
         bluetoothAdapter = bluetoothManager.adapter
-        bleScanner = bluetoothAdapter.bluetoothLeScanner
 
         requestBlePermissionsIfNeeded()
         initLogFile()
@@ -573,14 +645,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
         log("Device=${Build.MODEL}")
         log("Manufacturer=${Build.MANUFACTURER}")
 
-        if (autoConnectEnabled && blePermissionsGranted()) {
+        if (blePermissionsGranted()) {
             startBleForegroundServiceIfReady()
-            log("AUTO: enabled -> starting BLE scan")
-            handler.post {
-                if (!isGattConnected && !gattConnectInProgress && !isScanning) {
-                    startScan()
-                }
-            }
         } else if (autoConnectEnabled) {
             log("AUTO: waiting for BLE permissions before foreground service and scan")
         }
@@ -856,11 +922,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
             )
         }
 
+        val serviceIntent = SonicareBleForegroundService.startIntent(this)
+
         try {
-            ContextCompat.startForegroundService(
-                this,
-                SonicareBleForegroundService.startIntent(this)
-            )
+            ContextCompat.startForegroundService(this, serviceIntent)
             log(
                 "FOREGROUND SERVICE: connectedDevice start requested " +
                     "(Activity is visible)"
@@ -871,6 +936,32 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     "${e.javaClass.simpleName}: ${e.message}"
             )
             updateStatus("Nepodařilo se spustit BLE foreground service")
+            return
+        }
+
+        if (!isBleServiceBound && !isBleServiceBinding) {
+            try {
+                isBleServiceBinding = true
+                val bound = bindService(
+                    serviceIntent,
+                    bleServiceConnection,
+                    Context.BIND_AUTO_CREATE
+                )
+                if (!bound) {
+                    isBleServiceBinding = false
+                    log("FOREGROUND SERVICE: bindService returned false")
+                    updateStatus("Nepodařilo se připojit k BLE službě")
+                } else {
+                    log("FOREGROUND SERVICE: binding requested")
+                }
+            } catch (e: Exception) {
+                isBleServiceBinding = false
+                log(
+                    "FOREGROUND SERVICE BIND FAILED: " +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                )
+                updateStatus("Nepodařilo se připojit k BLE službě")
+            }
         }
     }
 
@@ -925,9 +1016,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
             if (blePermissionsGranted()) {
                 log("BLE permissions granted")
                 startBleForegroundServiceIfReady()
-                if (autoConnectEnabled && !isGattConnected && !gattConnectInProgress && !isScanning) {
-                    log("AUTO: permissions ready -> starting BLE scan")
-                    startScan()
+                if (autoConnectEnabled) {
+                    log("AUTO: permissions ready -> waiting for foreground service binder")
                 }
             } else {
                 log("BLE permissions denied -> automatic scan disabled")
@@ -954,8 +1044,6 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
         updateStatus("Skenuji BLE...  [Scanner v$APP_VERSION]")
 
-        isScanning = true
-
         val scanSettings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
             .setReportDelay(0L)
@@ -967,11 +1055,22 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     "bonded fallback enabled"
             )
 
-        bleScanner?.startScan(
-            null,
-            scanSettings,
-            scanCallback
-        )
+        val service = bleService
+        if (service == null) {
+            isScanning = false
+            log("SCAN: cannot start; foreground service is not bound")
+            updateStatus("BLE služba není připojena")
+            return
+        }
+
+        if (!service.startBleScan(scanSettings, scanCallback)) {
+            isScanning = false
+            log("SCAN: foreground service could not start BLE scan")
+            updateStatus("Nepodařilo se spustit BLE skenování")
+            return
+        }
+
+        isScanning = true
 
         handler.postDelayed({
             if (!isScanning) {
@@ -1079,7 +1178,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
         }
 
         try {
-            bleScanner?.stopScan(scanCallback)
+            bleService?.stopBleScan(scanCallback)
         } catch (e: Exception) {
             log("SCAN stop exception: ${e.message}")
         }
@@ -1140,15 +1239,12 @@ private var condorDiagLastTxNotificationAtMs = 0L
         log("Connection generation=$generation")
 
         try {
-            val newGatt =
-                device.connectGatt(
-                    this,
-                    false,
-                    gattCallback,
-                    BluetoothDevice.TRANSPORT_LE,
-                    BluetoothDevice.PHY_LE_1M_MASK,
-                    handler
-                )
+            val service = bleService
+                ?: throw IllegalStateException("Foreground BLE service is not bound")
+
+            service.setGattCallbackDelegate(gattCallback)
+            val newGatt = service.connectGatt(device, handler)
+                ?: throw IllegalStateException("Service returned no BluetoothGatt")
 
             bluetoothGatt = newGatt
 
@@ -4501,13 +4597,31 @@ private var condorDiagLastTxNotificationAtMs = 0L
             Thread.currentThread().interrupt()
         }
 
-        try {
-            bluetoothGatt?.close()
-        } catch (_: Exception) {
+        if (!isChangingConfigurations) {
+            // A real Activity shutdown also ends the user-started gateway.
+            // Screen locking does not call onDestroy(), so the service and GATT
+            // remain untouched while the app is merely in the background.
+            log("FOREGROUND SERVICE: stopping because MainActivity is being destroyed")
+            bleService?.shutdownGateway()
+            stopService(SonicareBleForegroundService.startIntent(this))
+        } else {
+            // During an Activity recreation the Service and GATT must survive.
+            bleService?.setGattCallbackDelegate(null)
+            bleService?.setLogListener(null)
         }
 
         bluetoothGatt = null
         gattConnectInProgress = false
+
+        if (isBleServiceBound) {
+            try {
+                unbindService(bleServiceConnection)
+            } catch (_: Exception) {
+            }
+            isBleServiceBound = false
+            bleService = null
+        }
+
 
         try {
             mqttManager.disconnect()
