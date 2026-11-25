@@ -75,6 +75,15 @@ object CondorProtocol {
         return buildFrame(MSG_SUBSCRIBE, payload)
     }
 
+    /** MSG_PUT_PROPS payload: product NUL port NUL {compact json} */
+    fun putPropsReq(productId: String, port: String, props: JSONObject): ByteArray =
+        buildFrame(
+            MSG_PUT_PROPS,
+            nulTerminatedAscii(productId) +
+                nulTerminatedAscii(port) +
+                props.toString().toByteArray(Charsets.UTF_8)
+        )
+
     fun unsubscribeReq(productId: String, port: String): ByteArray =
         buildFrame(
             MSG_UNSUBSCRIBE,
