@@ -60,7 +60,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
-        private const val APP_VERSION = "0.1.35-queuefix4"
+        private const val APP_VERSION = "0.1.35-queuefix5"
 
         private const val PERMISSION_REQUEST_CODE = 1001
         private const val UI_LOG_FLUSH_INTERVAL_MS = 100L
@@ -378,8 +378,21 @@ class MainActivity : AppCompatActivity() {
     // The upstream implementation serializes BLE writes by awaiting the
     // completion of each write operation; the next fragment is therefore
     // started from onCharacteristicWrite().
+    private data class CondorUrgentTxFrame(
+        val value: ByteArray,
+        val description: String,
+        val enqueuedAtElapsedMs: Long
+    )
+
+    // Urgent protocol replies are selected before normal frames at the next
+    // complete Condor-frame boundary. Never interleave fragments of frames.
+    private val condorUrgentTxFrameQueue =
+        java.util.ArrayDeque<CondorUrgentTxFrame>()
     private val condorTxFrameQueue = java.util.ArrayDeque<ByteArray>()
     private var condorTxActiveFrame: ByteArray? = null
+    private var condorTxActiveFrameIsUrgent = false
+    private var condorTxActiveFrameDescription = ""
+    private var condorTxActiveFrameEnqueuedAtMs = 0L
     private var condorTxActiveOffset = 0
     private var condorTxWriteInFlight = false
 
@@ -417,6 +430,7 @@ class MainActivity : AppCompatActivity() {
     // pacing because Condor requires prompt transport acknowledgements.
     private var condorGattWritePacingScheduled = false
     private val condorGattWritePacingDelayMs = 100L
+    private val condorGattWritePriorityFrameDispatchDelayMs = 10L
     private var condorGattWriteBusyCount = 0
 
     // Short rolling history of the last GATT operations. This is diagnostic
@@ -442,6 +456,7 @@ class MainActivity : AppCompatActivity() {
             condorTxActiveFrame = null
             condorTxActiveOffset = 0
             condorTxFrameQueue.clear()
+            condorUrgentTxFrameQueue.clear()
             condorGattWriteQueue.clear()
 
             log(
@@ -1447,7 +1462,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     log("last GATT BUSY 201: ${diagAge(condorDiagLastGattBusyAtMs)} ${condorDiagLastGattBusyDescription}; totalBusy=$condorDiagGattBusyTotal")
                     log("last GATT callback: ${diagAge(condorDiagLastGattCallbackAtMs)} state=$condorDiagLastGattCallbackState status=$condorDiagLastGattCallbackStatus")
                     log("pendingRequest=$condorPendingRequest; keepAliveCount=$condorIdleKeepAliveCount; keepAlivePending=$condorIdleKeepAlivePending")
-                    log("TX active=${condorTxActiveFrame != null}; txOffset=$condorTxActiveOffset; txQueue=${condorTxFrameQueue.size}; gattQueue=${condorGattWriteQueue.size}; gattInFlight=${condorGattWriteInFlight?.description ?: "none"}")
+                    log("TX active=${condorTxActiveFrameDescription.ifBlank { "none" }}; activeUrgent=$condorTxActiveFrameIsUrgent; txOffset=$condorTxActiveOffset; urgentTxQueue=${condorUrgentTxFrameQueue.size}; txQueue=${condorTxFrameQueue.size}; gattQueue=${condorGattWriteQueue.size}; gattInFlight=${condorGattWriteInFlight?.description ?: "none"}")
                     log("txNextSeq=${condorNextTxSeq and CondorProtocol.SEQ_MASK}; rxBuffer=${condorRxFrameBuffer.size} bytes")
                     dumpCondorGattHistory()
 
@@ -2548,7 +2563,9 @@ private var condorDiagLastTxNotificationAtMs = 0L
     @SuppressLint("MissingPermission")
     private fun sendCondorFrame(
         gatt: BluetoothGatt,
-        frame: ByteArray
+        frame: ByteArray,
+        urgent: Boolean = false,
+        description: String = "Condor type ${if (frame.size > 2) frame[2].toInt() and 0xFF else -1}"
     ) {
         if (bluetoothGatt != gatt || !isGattConnected) {
             log("CONDOR FRAME WRITE skipped: GATT is no longer connected")
@@ -2566,14 +2583,28 @@ private var condorDiagLastTxNotificationAtMs = 0L
             return
         }
 
+        val now = SystemClock.elapsedRealtime()
+        if (urgent) {
+            condorUrgentTxFrameQueue.addLast(
+                CondorUrgentTxFrame(
+                    value = frame.copyOf(),
+                    description = description,
+                    enqueuedAtElapsedMs = now
+                )
+            )
+        } else {
+            condorTxFrameQueue.add(frame.copyOf())
+        }
+
         log(
             "CONDOR TX frame queued: ${frame.size} bytes; " +
                 "BLE fragments=${((frame.size + 18) / 19)}; " +
+                "urgent=$urgent; description=$description; " +
+                "urgentQueue=${condorUrgentTxFrameQueue.size}; " +
+                "normalQueue=${condorTxFrameQueue.size}; " +
                 "writeInFlight=$condorTxWriteInFlight; " +
                 "GATT queue=${condorGattWriteQueue.size}"
         )
-
-        condorTxFrameQueue.add(frame.copyOf())
 
         if (
             !condorTxWriteInFlight &&
@@ -2598,14 +2629,32 @@ private var condorDiagLastTxNotificationAtMs = 0L
         if (condorTxWriteInFlight) return
 
         if (condorTxActiveFrame == null) {
-            if (condorTxFrameQueue.isEmpty()) return
+            if (condorUrgentTxFrameQueue.isNotEmpty()) {
+                val urgentFrame = condorUrgentTxFrameQueue.removeFirst()
+                condorTxActiveFrame = urgentFrame.value
+                condorTxActiveFrameIsUrgent = true
+                condorTxActiveFrameDescription = urgentFrame.description
+                condorTxActiveFrameEnqueuedAtMs = urgentFrame.enqueuedAtElapsedMs
+            } else {
+                if (condorTxFrameQueue.isEmpty()) return
+                condorTxActiveFrame = condorTxFrameQueue.removeFirst()
+                condorTxActiveFrameIsUrgent = false
+                condorTxActiveFrameDescription = "normal Condor frame"
+                condorTxActiveFrameEnqueuedAtMs = SystemClock.elapsedRealtime()
+            }
 
-            condorTxActiveFrame = condorTxFrameQueue.removeFirst()
             condorTxActiveOffset = 0
+            val queueWaitMs =
+                SystemClock.elapsedRealtime() - condorTxActiveFrameEnqueuedAtMs
 
             log(
-                "CONDOR TX: starting queued frame " +
-                    "(${condorTxActiveFrame!!.size} bytes)"
+                "CONDOR TX: starting queued frame; " +
+                    "description=$condorTxActiveFrameDescription; " +
+                    "urgent=$condorTxActiveFrameIsUrgent; " +
+                    "queueWait=${queueWaitMs}ms; " +
+                    "bytes=${condorTxActiveFrame!!.size}; " +
+                    "urgentQueue=${condorUrgentTxFrameQueue.size}; " +
+                    "normalQueue=${condorTxFrameQueue.size}"
             )
         }
 
@@ -2686,8 +2735,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
             characteristicUuid = CHAR_WRITE_NR_UUID,
             value = packet,
             description =
-                "RX_FRAME seq=$seq " +
-                    "offset=$condorTxActiveOffset..${end - 1} " +
+                "RX_FRAME ${condorTxActiveFrameDescription} " +
+                    "urgent=$condorTxActiveFrameIsUrgent " +
+                    "queueWait=${SystemClock.elapsedRealtime() - condorTxActiveFrameEnqueuedAtMs}ms " +
+                    "seq=$seq offset=$condorTxActiveOffset..${end - 1} " +
                     "${end}/${frame.size}",
             frameEndOffset = end,
             frameSeq = seq
@@ -2871,6 +2922,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
                              * that every incoming TX packet must be ACKed promptly.
                              */
                             val nextOp = condorGattWriteQueue.peekFirst()
+                            val urgentFrameReady =
+                                condorTxActiveFrame == null &&
+                                    condorUrgentTxFrameQueue.isNotEmpty() &&
+                                    condorGattWriteQueue.isEmpty()
 
                             if (
                                 nextOp?.kind == CondorGattWriteKind.TX_ACK &&
@@ -2882,6 +2937,12 @@ private var condorDiagLastTxNotificationAtMs = 0L
                                         "${condorGattWritePacingDelayMs} ms pacing"
                                 )
                                 pumpCondorGattWriteQueue(gatt)
+                            } else if (
+                                urgentFrameReady &&
+                                bluetoothGatt == gatt &&
+                                isGattConnected
+                            ) {
+                                scheduleCondorPriorityFrameStart(gatt)
                             } else if (
                                 !condorGattWritePacingScheduled &&
                                 bluetoothGatt == gatt &&
@@ -3034,6 +3095,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
             condorTxActiveFrame = null
             condorTxActiveOffset = 0
             condorTxFrameQueue.clear()
+            condorUrgentTxFrameQueue.clear()
             log(
                 "CONDOR TX: aborting current frame after GATT write failure"
             )
@@ -3135,10 +3197,17 @@ private var condorDiagLastTxNotificationAtMs = 0L
         } else if (
             condorGattWriteQueue.isEmpty() &&
             condorTxActiveFrame == null &&
-            condorTxFrameQueue.isNotEmpty() &&
+            (
+                condorUrgentTxFrameQueue.isNotEmpty() ||
+                condorTxFrameQueue.isNotEmpty()
+            ) &&
             !condorTxWriteInFlight
         ) {
-            scheduleCondorRxFrameStart(gatt)
+            if (condorUrgentTxFrameQueue.isNotEmpty()) {
+                scheduleCondorPriorityFrameStart(gatt)
+            } else {
+                scheduleCondorRxFrameStart(gatt)
+            }
         }
 
     }
@@ -3180,6 +3249,29 @@ private var condorDiagLastTxNotificationAtMs = 0L
         log(
             "CONDOR GATT WRITE: next RX_FRAME start scheduled in " +
                 "${condorGattWritePacingDelayMs} ms"
+        )
+    }
+
+    private fun scheduleCondorPriorityFrameStart(gatt: BluetoothGatt) {
+        if (
+            condorGattWritePacingScheduled ||
+            bluetoothGatt != gatt ||
+            !isGattConnected ||
+            condorTxActiveFrame != null ||
+            condorUrgentTxFrameQueue.isEmpty() ||
+            condorGattWriteQueue.isNotEmpty()
+        ) {
+            return
+        }
+
+        condorGattWritePacingScheduled = true
+        handler.postDelayed(
+            condorGattWritePacingRunnable,
+            condorGattWritePriorityFrameDispatchDelayMs
+        )
+        log(
+            "CONDOR GATT WRITE: urgent response will start in " +
+                "${condorGattWritePriorityFrameDispatchDelayMs} ms"
         )
     }
 
@@ -3275,12 +3367,16 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 sendNextCondorTxFragment(gatt)
             } else if (
                 condorTxActiveFrame == null &&
-                condorTxFrameQueue.isNotEmpty() &&
+                (
+                    condorUrgentTxFrameQueue.isNotEmpty() ||
+                    condorTxFrameQueue.isNotEmpty()
+                ) &&
                 !condorTxWriteInFlight
             ) {
                 log(
                     "CONDOR TX PACING: starting next queued frame; " +
-                        "queuedFrames=${condorTxFrameQueue.size}"
+                        "urgentQueue=${condorUrgentTxFrameQueue.size}; " +
+                        "normalQueue=${condorTxFrameQueue.size}"
                 )
                 startNextCondorTxFrame(gatt)
             }
@@ -3300,6 +3396,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
         condorTxActiveFrame = null
         condorTxActiveOffset = 0
         condorTxFrameQueue.clear()
+        condorUrgentTxFrameQueue.clear()
+        condorTxActiveFrameIsUrgent = false
+        condorTxActiveFrameDescription = ""
+        condorTxActiveFrameEnqueuedAtMs = 0L
     }
 
     @SuppressLint("MissingPermission")
@@ -3590,7 +3690,12 @@ private var condorDiagLastTxNotificationAtMs = 0L
             log("CHANGE_IND_RESP FRAME HEX: ${bytesToHex(ack)}")
             log("CHANGE_IND_RESP frame length=${ack.size} bytes")
             condorDiagLastChangeIndicationAckAtMs = SystemClock.elapsedRealtime()
-            sendCondorFrame(gatt, ack)
+            sendCondorFrame(
+                gatt,
+                ack,
+                urgent = true,
+                description = "CHANGE_IND_RESP"
+            )
         } else {
             log("CONDOR ChangeIndication ACK skipped: GATT disconnected")
         }
