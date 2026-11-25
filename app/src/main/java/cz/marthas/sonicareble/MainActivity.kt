@@ -4629,4 +4629,5 @@ private var condorDiagLastTxNotificationAtMs = 0L
         }
 
         super.onDestroy()
-    }}
+    }
+}
