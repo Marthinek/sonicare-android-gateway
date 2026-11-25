@@ -43,6 +43,8 @@ import java.io.FileOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -53,9 +55,13 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
-        private const val APP_VERSION = "0.1.35-queuefix1"
+        private const val APP_VERSION = "0.1.35-queuefix2"
 
         private const val PERMISSION_REQUEST_CODE = 1001
+        private const val UI_LOG_FLUSH_INTERVAL_MS = 100L
+        private const val UI_LOG_MAX_CHARS = 120_000
+        private const val UI_LOG_BATCH_MAX_LINES = 250
+        private const val UI_LOG_BATCH_MAX_CHARS = 24_000
 
         private val CONDOR_SERVICE_UUID =
             UUID.fromString("e50ba3c0-af04-4564-92ad-fef019489de6")
@@ -105,6 +111,57 @@ class MainActivity : AppCompatActivity() {
     private val condorEarlyConnectRetryDelayMs = 1_500L
 
     private val handler = Handler(Looper.getMainLooper())
+
+    // Keep BLE callbacks free from expensive TextView append/scroll work.
+    // The complete diagnostic stream is still written to the Downloads log;
+    // this queue only feeds a bounded on-screen preview in batches.
+    private val pendingUiLogLines = ConcurrentLinkedQueue<String>()
+    private val uiLogFlushScheduled = AtomicBoolean(false)
+    private val uiLogFlushRunnable = object : Runnable {
+        override fun run() {
+            val batch = StringBuilder()
+            var lineCount = 0
+
+            while (
+                lineCount < UI_LOG_BATCH_MAX_LINES &&
+                batch.length < UI_LOG_BATCH_MAX_CHARS
+            ) {
+                val line = pendingUiLogLines.poll() ?: break
+                batch.append(line).append('\n')
+                lineCount++
+            }
+
+            if (batch.isNotEmpty() && this@MainActivity::logView.isInitialized) {
+                val currentText = logView.text
+                val projectedLength = currentText.length + batch.length
+
+                if (projectedLength > UI_LOG_MAX_CHARS) {
+                    val targetOldLength =
+                        (UI_LOG_MAX_CHARS - batch.length).coerceAtLeast(0)
+                    val dropUntil =
+                        (currentText.length - targetOldLength).coerceAtLeast(0)
+                    val nextLine = currentText.indexOf('\n', dropUntil)
+                    val keepFrom = if (nextLine >= 0) nextLine + 1 else dropUntil
+
+                    logView.text =
+                        currentText.subSequence(keepFrom, currentText.length).toString() +
+                            batch.toString()
+                } else {
+                    logView.append(batch.toString())
+                }
+
+                val scrollView = logView.parent as? ScrollView
+                scrollView?.post {
+                    scrollView.fullScroll(ScrollView.FOCUS_DOWN)
+                }
+            }
+
+            uiLogFlushScheduled.set(false)
+            if (pendingUiLogLines.isNotEmpty()) {
+                scheduleUiLogFlush()
+            }
+        }
+    }
 
     private lateinit var logView: TextView
     private lateinit var statusView: TextView
@@ -1912,7 +1969,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     )
 
                 log(
-                    "writeDescriptor API33+ immediateResult=$result"
+                    "writeDescriptor API33+ immediateResult=$result " +
+                        "(${bluetoothStatusCodeName(result)})"
                 )
 
                 if (
@@ -1920,7 +1978,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
                 ) {
                     log(
                         "ERROR: CCCD write was not accepted by Android " +
-                            "(immediate status=$result)"
+                            "(immediate status=$result " +
+                            "${bluetoothStatusCodeName(result)})"
                     )
                 }
 
@@ -2008,8 +2067,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     )
 
                 log(
-                    "writeDescriptor API33+ $label: result=$result, " +
-                        "value=${bytesToHex(value)}, gattId=${System.identityHashCode(gatt)}"                )
+                    "writeDescriptor API33+ $label: result=$result " +
+                        "(${bluetoothStatusCodeName(result)}), " +
+                        "value=${bytesToHex(value)}, gattId=${System.identityHashCode(gatt)}"
+                )
             } else {
                 @Suppress("DEPRECATION")
                 cccd.value = value
@@ -2077,7 +2138,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
                 log(
                     "writeCharacteristic API33+ " +
-                        "returned=$result"
+                        "returned=$result (${bluetoothStatusCodeName(result)})"
                 )
             } else {
                 @Suppress("DEPRECATION")
@@ -2154,7 +2215,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
                 log(
                     "writeCharacteristic API33+ " +
-                        "returned=$result"
+                        "returned=$result (${bluetoothStatusCodeName(result)})"
                 )
             } else {
                 @Suppress("DEPRECATION")
@@ -2555,7 +2616,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
 
                     log(
                         "CONDOR GATT WRITE immediateResult=$result " +
-                            "op=${op.kind}"
+                            "(${bluetoothStatusCodeName(result)}) op=${op.kind}"
                     )
                     recordCondorGattHistory(
                         "WRITE_RESULT result=$result ${op.description}"
@@ -2702,7 +2763,10 @@ private var condorDiagLastTxNotificationAtMs = 0L
                                     gatt,
                                     op,
                                     BluetoothStatusCodes
-                                        .ERROR_GATT_WRITE_REQUEST_BUSY
+                                        .ERROR_GATT_WRITE_REQUEST_BUSY,
+                                    bluetoothStatusCodeName(
+                                        BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY
+                                    )
                                 )
                             } else {
                                 condorGattWriteRetryScheduled = true
@@ -2723,7 +2787,8 @@ private var condorDiagLastTxNotificationAtMs = 0L
                             handleCondorGattWriteFailure(
                                 gatt,
                                 op,
-                                result
+                                result,
+                                bluetoothStatusCodeName(result)
                             )
                         }
                     }
@@ -2791,11 +2856,12 @@ private var condorDiagLastTxNotificationAtMs = 0L
     private fun handleCondorGattWriteFailure(
         gatt: BluetoothGatt,
         op: CondorGattWriteOp,
-        status: Int
+        status: Int,
+        statusName: String = gattStatusName(status)
     ) {
         log(
             "CONDOR GATT WRITE FAILED: ${op.description}; " +
-                "status=$status (${gattStatusName(status)})"
+                "status=$status ($statusName)"
         )
 
         if (op.kind == CondorGattWriteKind.RX_FRAME) {
@@ -4075,6 +4141,30 @@ private var condorDiagLastTxNotificationAtMs = 0L
         }
     }
 
+    private fun bluetoothStatusCodeName(status: Int): String =
+        when (status) {
+            BluetoothStatusCodes.SUCCESS ->
+                "SUCCESS"
+            BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ALLOWED ->
+                "ERROR_BLUETOOTH_NOT_ALLOWED"
+            BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED ->
+                "ERROR_BLUETOOTH_NOT_ENABLED"
+            BluetoothStatusCodes.ERROR_DEVICE_NOT_BONDED ->
+                "ERROR_DEVICE_NOT_BONDED"
+            BluetoothStatusCodes.ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION ->
+                "ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION"
+            BluetoothStatusCodes.ERROR_PROFILE_SERVICE_NOT_BOUND ->
+                "ERROR_PROFILE_SERVICE_NOT_BOUND"
+            BluetoothStatusCodes.ERROR_GATT_WRITE_NOT_ALLOWED ->
+                "ERROR_GATT_WRITE_NOT_ALLOWED"
+            BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY ->
+                "ERROR_GATT_WRITE_REQUEST_BUSY"
+            BluetoothStatusCodes.ERROR_UNKNOWN ->
+                "ERROR_UNKNOWN"
+            else ->
+                "UNKNOWN_BLUETOOTH_STATUS"
+        }
+
     private fun gattStatusName(
         status: Int
     ): String {
@@ -4253,36 +4343,31 @@ private var condorDiagLastTxNotificationAtMs = 0L
         }
     }
 
+    private fun scheduleUiLogFlush() {
+        if (uiLogFlushScheduled.compareAndSet(false, true)) {
+            handler.postDelayed(
+                uiLogFlushRunnable,
+                UI_LOG_FLUSH_INTERVAL_MS
+            )
+        }
+    }
+
     private fun log(
         message: String
     ) {
-
         val timestamp =
-            timeFormat.format(Date())
+            synchronized(timeFormat) {
+                timeFormat.format(Date())
+            }
 
         val line =
             "[$timestamp] $message"
 
-        // Queue file I/O so BLE callbacks are not blocked by storage writes.
+        // Persist every line independently of the throttled on-screen preview.
         writeLogLineToFile(line)
 
-        runOnUiThread {
-
-            logView.append(
-                "$line\n"
-            )
-
-            logView.parent
-                ?.let {
-                    if (it is ScrollView) {
-                        it.post {
-                            it.fullScroll(
-                                ScrollView.FOCUS_DOWN
-                            )
-                        }
-                    }
-                }
-        }
+        pendingUiLogLines.offer(line)
+        scheduleUiLogFlush()
     }
 
     private fun updateStatus(
@@ -4315,7 +4400,34 @@ private var condorDiagLastTxNotificationAtMs = 0L
         )
     }
 
+    override fun onResume() {
+        super.onResume()
+        log(
+            "ACTIVITY LIFECYCLE: onResume; " +
+                "isFinishing=$isFinishing"
+        )
+    }
+
+    override fun onPause() {
+        super.onPause()
+        log(
+            "ACTIVITY LIFECYCLE: onPause; " +
+                "isFinishing=$isFinishing; " +
+                "isChangingConfigurations=$isChangingConfigurations"
+        )
+    }
+
+    override fun onStop() {
+        super.onStop()
+        log(
+            "ACTIVITY LIFECYCLE: onStop; " +
+                "isFinishing=$isFinishing; " +
+                "isChangingConfigurations=$isChangingConfigurations"
+        )
+    }
+
     override fun onDestroy() {
+        log("ACTIVITY LIFECYCLE: onDestroy")
 
         condorIdleWatchdogRunning = false
         handler.removeCallbacks(condorIdleWatchdogRunnable)
