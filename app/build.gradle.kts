@@ -11,8 +11,8 @@ android {
         applicationId = "cz.marthas.sonicareble"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.1.35-queuefix4"
+        versionCode = 8
+        versionName = "0.1.35-queuefix5"
     }
 
     compileOptions {
