@@ -5,21 +5,34 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 
 /**
- * Keeps the application process in foreground-service state while the
- * Sonicare BLE gateway is active.
+ * Owns the Android BLE scanner and BluetoothGatt connection.
  *
- * Phase 1 deliberately leaves the existing GATT implementation in
- * MainActivity. This service is a process-lifetime guard; the next step can
- * move GATT ownership into this service once lock-screen behavior is verified.
+ * MainActivity remains the current Condor protocol/UI controller. The service
+ * creates the BLE objects with its own Service context and forwards Android
+ * callbacks to the currently bound controller. This keeps the physical BLE
+ * connection and scanner attached to a foreground service while the screen is
+ * off, without rewriting the proven Condor framing/queue implementation.
  */
 class SonicareBleForegroundService : Service() {
 
@@ -32,10 +45,25 @@ class SonicareBleForegroundService : Service() {
             Intent(context, SonicareBleForegroundService::class.java)
     }
 
+    inner class LocalBinder : Binder() {
+        fun getService(): SonicareBleForegroundService = this@SonicareBleForegroundService
+    }
+
+    private val binder = LocalBinder()
+    private var foregroundActive = false
+    private var foregroundStartError: String? = null
+    private var bluetoothLeScanner: BluetoothLeScanner? = null
+    private var bluetoothGatt: BluetoothGatt? = null
+    private var activeScanCallback: ScanCallback? = null
+    private var scanCallbackProxy: ScanCallback? = null
+    private var gattCallbackDelegate: BluetoothGattCallback? = null
+    private var logListener: ((String) -> Unit)? = null
+
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        Log.i(TAG, "Foreground service created")
+        val manager = getSystemService(BluetoothManager::class.java)
+        bluetoothLeScanner = manager?.adapter?.bluetoothLeScanner
+        serviceLog("Service created; BLE scanner available=${bluetoothLeScanner != null}")
     }
 
     override fun onStartCommand(
@@ -59,22 +87,251 @@ class SonicareBleForegroundService : Service() {
                 serviceType
             )
 
-            Log.i(TAG, "Foreground service active; type=connectedDevice")
+            foregroundActive = true
+            foregroundStartError = null
+            serviceLog("Foreground active; type=connectedDevice")
         } catch (e: Exception) {
-            Log.e(TAG, "Unable to enter connectedDevice foreground state", e)
+            foregroundActive = false
+            foregroundStartError = "${e.javaClass.simpleName}: ${e.message}"
+            serviceLog("FOREGROUND START FAILED: $foregroundStartError")
             stopSelf(startId)
         }
 
-        // The service is started again by MainActivity after the user opens it.
-        // It does not claim to own or restore a GATT connection in this phase.
         return START_NOT_STICKY
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            return
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    fun isForegroundActive(): Boolean = foregroundActive
+
+    fun getForegroundStartError(): String? = foregroundStartError
+
+    fun setLogListener(listener: ((String) -> Unit)?) {
+        logListener = listener
+    }
+
+    fun setGattCallbackDelegate(callback: BluetoothGattCallback?) {
+        gattCallbackDelegate = callback
+        serviceLog("GATT callback delegate ${if (callback == null) "detached" else "attached"}")
+    }
+
+    fun getBluetoothGatt(): BluetoothGatt? = bluetoothGatt
+
+    fun setBluetoothGatt(gatt: BluetoothGatt?) {
+        bluetoothGatt = gatt
+        serviceLog(
+            if (gatt == null) "GATT reference cleared"
+            else "GATT reference stored id=${System.identityHashCode(gatt)}"
+        )
+    }
+
+    @Suppress("MissingPermission")
+    fun startBleScan(
+        settings: ScanSettings,
+        delegate: ScanCallback
+    ): Boolean {
+        val scanner = bluetoothLeScanner ?: run {
+            serviceLog("SCAN failed: BluetoothLeScanner is unavailable")
+            return false
         }
 
+        stopBleScan()
+        val proxy = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                delegate.onScanResult(callbackType, result)
+            }
+
+            override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                delegate.onBatchScanResults(results)
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                serviceLog("BLE scan callback failed: errorCode=$errorCode")
+                delegate.onScanFailed(errorCode)
+            }
+        }
+
+        return try {
+            activeScanCallback = delegate
+            scanCallbackProxy = proxy
+            scanner.startScan(null, settings, proxy)
+            serviceLog("BLE scan started by foreground service")
+            true
+        } catch (e: Exception) {
+            activeScanCallback = null
+            scanCallbackProxy = null
+            serviceLog("BLE scan start failed: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    @Suppress("MissingPermission")
+    fun stopBleScan(delegate: ScanCallback? = null) {
+        val activeDelegate = activeScanCallback
+        if (activeDelegate == null) return
+        if (delegate != null && delegate !== activeDelegate) return
+
+        try {
+            val proxy = scanCallbackProxy
+            if (proxy != null) {
+                bluetoothLeScanner?.stopScan(proxy)
+            }
+            serviceLog("BLE scan stopped by foreground service")
+        } catch (e: Exception) {
+            serviceLog("BLE scan stop failed: ${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            activeScanCallback = null
+            scanCallbackProxy = null
+        }
+    }
+
+    @Suppress("MissingPermission")
+    fun connectGatt(
+        device: BluetoothDevice,
+        callbackHandler: Handler
+    ): BluetoothGatt? {
+        if (bluetoothGatt != null) {
+            serviceLog("GATT connect ignored: an existing GATT object is still stored")
+            return bluetoothGatt
+        }
+
+        val proxy = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(
+                gatt: BluetoothGatt,
+                status: Int,
+                newState: Int
+            ) {
+                serviceLog("GATT callback in Service: state=$newState status=$status")
+                gattCallbackDelegate?.onConnectionStateChange(gatt, status, newState)
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                gattCallbackDelegate?.onServicesDiscovered(gatt, status)
+            }
+
+            @Deprecated("Deprecated in Android 13; use value overload")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                gattCallbackDelegate?.onCharacteristicRead(gatt, characteristic, status)
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int
+            ) {
+                gattCallbackDelegate?.onCharacteristicRead(gatt, characteristic, value, status)
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int
+            ) {
+                gattCallbackDelegate?.onDescriptorWrite(gatt, descriptor, status)
+            }
+
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                gattCallbackDelegate?.onCharacteristicWrite(gatt, characteristic, status)
+            }
+
+            @Deprecated("Deprecated in Android 13; use value overload")
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic
+            ) {
+                gattCallbackDelegate?.onCharacteristicChanged(gatt, characteristic)
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                gattCallbackDelegate?.onCharacteristicChanged(gatt, characteristic, value)
+            }
+        }
+
+        return try {
+            val gatt = device.connectGatt(
+                this,
+                false,
+                proxy,
+                BluetoothDevice.TRANSPORT_LE,
+                BluetoothDevice.PHY_LE_1M_MASK,
+                callbackHandler
+            )
+            bluetoothGatt = gatt
+            serviceLog(
+                "GATT connect created from Service context; " +
+                    "device=${device.address}; gattId=${System.identityHashCode(gatt)}"
+            )
+            gatt
+        } catch (e: Exception) {
+            serviceLog("GATT connect exception: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+    }
+
+    @Suppress("MissingPermission")
+    fun disconnectGatt() {
+        val gatt = bluetoothGatt ?: return
+        serviceLog("GATT disconnect requested by client")
+        try {
+            gatt.disconnect()
+        } catch (e: Exception) {
+            serviceLog("GATT disconnect exception: ${e.message}")
+        }
+    }
+
+    @Suppress("MissingPermission")
+    fun shutdownGateway() {
+        serviceLog("Gateway shutdown requested")
+        stopBleScan()
+        val gatt = bluetoothGatt
+        bluetoothGatt = null
+        if (gatt != null) {
+            try {
+                gatt.disconnect()
+            } catch (_: Exception) {
+            }
+            try {
+                gatt.close()
+            } catch (_: Exception) {
+            }
+        }
+        gattCallbackDelegate = null
+        logListener = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        foregroundActive = false
+        stopSelf()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        serviceLog("Task removed; stopping BLE gateway")
+        shutdownGateway()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun serviceLog(message: String) {
+        Log.i(TAG, message)
+        try {
+            logListener?.invoke(message)
+        } catch (e: Exception) {
+            Log.w(TAG, "Log listener failed", e)
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Sonicare BLE gateway",
@@ -84,16 +341,15 @@ class SonicareBleForegroundService : Service() {
             setShowBadge(false)
             lockscreenVisibility = Notification.VISIBILITY_PRIVATE
         }
-
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(channel)
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(channel)
     }
 
     private fun buildNotification(): Notification {
+        createNotificationChannel()
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
-
         val contentPendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -104,7 +360,7 @@ class SonicareBleForegroundService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle("Sonicare BLE Gateway")
-            .setContentText("Gateway běží na pozadí")
+            .setContentText("BLE spojení běží na pozadí")
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -114,10 +370,18 @@ class SonicareBleForegroundService : Service() {
             .build()
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
-
     override fun onDestroy() {
-        Log.i(TAG, "Foreground service destroyed")
+        serviceLog("Service destroyed")
+        stopBleScan()
+        val gatt = bluetoothGatt
+        bluetoothGatt = null
+        try {
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gattCallbackDelegate = null
+        logListener = null
+        foregroundActive = false
         super.onDestroy()
     }
 }
