@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "SonicareBLE"
-        private const val APP_VERSION = "0.1.34"
+        private const val APP_VERSION = "0.1.35-queuefix1"
 
         private const val PERMISSION_REQUEST_CODE = 1001
 
@@ -247,6 +247,9 @@ class MainActivity : AppCompatActivity() {
         java.util.ArrayDeque<CondorGattWriteOp>()
 
     private var condorGattWriteInFlight: CondorGattWriteOp? = null
+    // Protect the API 33+ immediate-completion path from re-entrant/concurrent pumps.
+    private var condorGattWritePumpRunning = false
+    private var condorGattWritePumpRequested = false
     private var condorGattWriteRetryScheduled = false
     private val condorGattWriteRetryDelayMs = 75L
     private val condorGattWriteMaxBusyRetries = 20
@@ -989,6 +992,13 @@ private var condorDiagLastTxNotificationAtMs = 0L
     @SuppressLint("MissingPermission")
     private fun connectSelectedDevice(autoRetry: Boolean = false) {
 
+        // BLE scan callbacks may arrive off the main thread. Keep connection state
+        // and all subsequent GATT state transitions on the same main looper.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post { connectSelectedDevice(autoRetry) }
+            return
+        }
+
         if (!autoRetry) {
             manualDisconnectRequested = false
         }
@@ -1035,7 +1045,9 @@ private var condorDiagLastTxNotificationAtMs = 0L
                     this,
                     false,
                     gattCallback,
-                    BluetoothDevice.TRANSPORT_LE
+                    BluetoothDevice.TRANSPORT_LE,
+                    BluetoothDevice.PHY_LE_1M_MASK,
+                    handler
                 )
 
             bluetoothGatt = newGatt
@@ -2486,6 +2498,14 @@ private var condorDiagLastTxNotificationAtMs = 0L
     private fun pumpCondorGattWriteQueue(
         gatt: BluetoothGatt
     ) {
+        if (condorGattWritePumpRunning) {
+            condorGattWritePumpRequested = true
+            log("CONDOR GATT WRITE: pump already running; another pass deferred")
+            return
+        }
+
+        condorGattWritePumpRunning = true
+        try {
         if (bluetoothGatt != gatt || !isGattConnected) {
             log("CONDOR GATT WRITE: pump aborted, GATT disconnected")
             return
@@ -2754,8 +2774,20 @@ private var condorDiagLastTxNotificationAtMs = 0L
             condorGattWriteQueue.removeFirst()
             handleCondorGattWriteFailure(gatt, op, -1)
         }
-    }
+        } finally {
+            condorGattWritePumpRunning = false
 
+            if (condorGattWritePumpRequested) {
+                condorGattWritePumpRequested = false
+
+                if (bluetoothGatt == gatt && isGattConnected) {
+                    handler.post {
+                        pumpCondorGattWriteQueue(gatt)
+                    }
+                }
+            }
+        }
+    }
     private fun handleCondorGattWriteFailure(
         gatt: BluetoothGatt,
         op: CondorGattWriteOp,
@@ -3030,6 +3062,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
         condorGattWritePacingScheduled = false
         handler.removeCallbacks(condorGattWritePacingRunnable)
         condorGattWriteInFlight = null
+        condorGattWritePumpRequested = false
         condorGattWriteQueue.clear()
 
         condorTxWriteInFlight = false
