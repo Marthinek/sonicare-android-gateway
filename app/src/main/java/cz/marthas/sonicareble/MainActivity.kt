@@ -129,12 +129,12 @@ class MainActivity : AppCompatActivity() {
             bleService = service
             isBleServiceBound = true
             isBleServiceBinding = false
-            service.setGattCallbackDelegate(gattCallback)
             service.setLogListener { message ->
                 handler.post {
                     log("BLE SERVICE: $message")
                 }
             }
+            service.setGattCallbackDelegate(gattCallback)
 
             val error = service.getForegroundStartError()
             log(
@@ -156,6 +156,9 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             log("FOREGROUND SERVICE: disconnected from service binder")
             bleService = null
+            localBluetoothGatt = null
+            isGattConnected = false
+            gattConnectInProgress = false
             isBleServiceBound = false
             isBleServiceBinding = false
         }
@@ -163,12 +166,18 @@ class MainActivity : AppCompatActivity() {
         override fun onBindingDied(name: ComponentName?) {
             log("FOREGROUND SERVICE: service binding died")
             bleService = null
+            localBluetoothGatt = null
+            isGattConnected = false
+            gattConnectInProgress = false
             isBleServiceBound = false
             isBleServiceBinding = false
         }
 
         override fun onNullBinding(name: ComponentName?) {
             log("FOREGROUND SERVICE: service returned a null binding")
+            bleService = null
+            localBluetoothGatt = null
+            isBleServiceBound = false
             isBleServiceBinding = false
         }
     }
