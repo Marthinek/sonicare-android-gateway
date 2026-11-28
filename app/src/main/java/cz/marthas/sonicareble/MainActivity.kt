@@ -426,15 +426,15 @@ class MainActivity : AppCompatActivity() {
     private var condorGattWritePumpRunning = false
     private var condorGattWritePumpRequested = false
     private var condorGattWriteRetryScheduled = false
-    private val condorGattWriteRetryDelayMs = 75L
-    private val condorGattWriteMaxBusyRetries = 20
+    private val condorGattWriteRetryDelayMs = 5L
+    private val condorGattWriteMaxBusyRetries = 100
 
     // RX_FRAME writes use 100 ms pacing as a diagnostic experiment to
     // reduce Android GATT write congestion. TX_ACK writes bypass this
     // pacing because Condor requires prompt transport acknowledgements.
     private var condorGattWritePacingScheduled = false
-    private val condorGattWritePacingDelayMs = 100L
-    private val condorGattWritePriorityFrameDispatchDelayMs = 10L
+    private val condorGattWritePacingDelayMs = 0L
+    private val condorGattWritePriorityFrameDispatchDelayMs = 0L
     private var condorGattWriteBusyCount = 0
 
     // Short rolling history of the last GATT operations. This is diagnostic
@@ -3022,7 +3022,7 @@ private var condorDiagLastTxNotificationAtMs = 0L
                              */
                             /*
                              * TX_ACK is time-critical. Do not put an ACK behind
-                             * the 100 ms RX_FRAME pacing experiment.
+                             * the previous RX_FRAME pacing experiment.
                              *
                              * RX_FRAME writes remain deliberately paced to avoid
                              * Android GATT_BUSY (201), while a queued TX_ACK is
